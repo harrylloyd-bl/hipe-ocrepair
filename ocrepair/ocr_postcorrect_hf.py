@@ -62,7 +62,7 @@ The CSV must have exactly these columns:
 token_id,ocr_hypothesis,ocr_postcorrection_output,error_type,confidence,uncertain_chars,notes
 
 Rules for the CSV:
-- error_type: use one of these known types when they apply: over_segmentation, misrecognized_char, under_segmentation, wrong_word, uncertain, no_change
+- error_type: use one of these known types when they apply: over_segmentation, misrecognized_char, under_segmentation, missing_character, wrong_word, uncertain, no_change
 - If the error does not fit any known type, invent a descriptive snake_case label and prefix it with "custom:" (e.g. custom:long_s_substitution, custom:ink_bleed_merge, custom:ligature_ct). Be specific — do not use generic custom labels like custom:other.
 - You may assign multiple error types to one token by separating them with a pipe character | (e.g. broken_hyphen|spacing or garbled_char|custom:long_s_substitution)
 - confidence must be: high, medium, or low
