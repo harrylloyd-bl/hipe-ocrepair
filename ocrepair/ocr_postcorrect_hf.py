@@ -18,6 +18,14 @@ import json      # for reading/writing JSON files
 import os        # for environment variables and file paths
 import sys       # for stderr output and exit codes
 
+try:
+    from dotenv import load_dotenv  # for environment variables from .env  # ty:ignore[unresolved-import]
+    if "HF_TOKEN" not in os.environ:
+        load_dotenv()
+except ImportError:
+    pass
+
+
 # Lookup table mapping friendly short names to full Hugging Face model IDs.
 # This lets you type e.g. --model mistral3 instead of the full path.
 MODEL_REGISTRY = {
@@ -34,15 +42,26 @@ MODEL_REGISTRY = {
 #   2) produce a CSV corrections log (after the marker CORRECTIONS_CSV)
 #   3) produce a discovered error types section (after the marker DISCOVERED_ERRORS)
 SYSTEM_PROMPT = """You are an expert in historical OCR post-correction for newspapers from the 17th to 20th century in English. You will receive a JSON containing OCR tokens from historical newspapers. 
-STEP1 - Your task: 
-1. Read the "ocr_hypothesis" field in each token 2. Correct OCR errors and write the corrected text into "ocr_postcorrection_output" 3. Do NOT modify any other field in the JSON 4. Do NOT alter person names or place names 5. Check the "language" field and correct only within that language — do not translate or deviate 6. Pay close attention to accented characters — preserve or restore them correctly 7. Fix common historical OCR errors such as: broken hyphens splitting words across lines, garbled characters (e.g. "f" misread as "ſ"), incorrect spacing, merged or split words 8. If a token is too ambiguous to correct confidently, copy the ocr_hypothesis unchanged into ocr_postcorrection_output 9. Return ONLY the modified JSON. No explanation, no preamble, no markdown fences.
+STEP 1 - Your task: 
+1. Read the "ocr_hypothesis" field in each token
+2. Correct OCR errors and write the corrected text into "ocr_postcorrection_output"
+3. Do NOT modify any other field in the JSON
+4. Do NOT alter person names or place names
+5. Check the "language" field and correct only within that language — do not translate or deviate
+6. Pay close attention to accented characters — preserve or restore them correctly
+7. Fix four classes of common historical OCR errors:
+- Over-segmentation: words being broken across lines to fit within the margins and hyphens being replaced with spaces e.g. [incorrect] "before the follow ing morning" -> [corrected] "before the follow-ing morning"
+- Under-segementation: spaces being removed between words e.g. [incorrect] "Two Closes of Rich oldSwarth LAND" -> [corrected] "Two Closes of Rich old Swarth LAND"
+- Misrecognized character: e.g. [incorrect] "aſter" -> [corrected] "after"; [incorrect] "We sailed from Kalaniita Bay, ar.d soon we made the coast" -> [corrected] "We sailed from Kalaniita Bay, and soon we made the coast"
+8. If a token is too ambiguous to correct confidently, copy the ocr_hypothesis unchanged into ocr_postcorrection_output
+9. Return ONLY the modified JSON. No explanation, no preamble, no markdown fences.
 
 STEP 2 — After the corrected JSON, output a CSV corrections log.
 The CSV must have exactly these columns:
 token_id,ocr_hypothesis,ocr_postcorrection_output,error_type,confidence,uncertain_chars,notes
 
 Rules for the CSV:
-- error_type: use one of these known types when they apply: broken_hyphen, garbled_char, merged_words, split_word, spacing, wrong_word, uncertain, no_change
+- error_type: use one of these known types when they apply: over_segmentation, misrecognized_char, under_segmentation, wrong_word, uncertain, no_change
 - If the error does not fit any known type, invent a descriptive snake_case label and prefix it with "custom:" (e.g. custom:long_s_substitution, custom:ink_bleed_merge, custom:ligature_ct). Be specific — do not use generic custom labels like custom:other.
 - You may assign multiple error types to one token by separating them with a pipe character | (e.g. broken_hyphen|spacing or garbled_char|custom:long_s_substitution)
 - confidence must be: high, medium, or low
@@ -70,7 +89,7 @@ Output format — follow this structure exactly:
 
 def get_client():
     """Create and return a Hugging Face InferenceClient, authenticated with HF_TOKEN."""
-    from huggingface_hub import InferenceClient  # HF's Python SDK for inference
+    from huggingface_hub import InferenceClient  # HF's Python SDK for inference  # ty:ignore[unresolved-import]
 
     # Read the token from the environment variable
     token = os.environ.get("HF_TOKEN")
@@ -259,7 +278,8 @@ def main():
     # ── --run-all branch: loop through every registered model ────────────
     if args.run_all:
         out_dir = args.output_dir or os.getcwd()  # default output dir = current directory
-        os.makedirs(out_dir, exist_ok=True)        # create dir if it doesn't exist
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=False)        # create dir if it doesn't exist
 
         client = get_client()  # one client for all requests (same token)
 
@@ -268,8 +288,8 @@ def main():
             mid = f"{full_id}:cheapest" if not args.no_cheapest else full_id
 
             # Build output file paths: one .json and one .csv per model
-            json_path = os.path.join(out_dir, f"{short_name}.json")
-            csv_path = os.path.join(out_dir, f"{short_name}.csv")
+            json_path = os.path.join(out_dir, f"hipe-ocrepair-bench_v0.9_{short_name}.json")
+            csv_path = os.path.join(out_dir, f"hipe-ocrepair-bench_v0.9_{short_name}.csv")
             print(f"Running {short_name} ({mid}) -> {json_path}, {csv_path}", file=sys.stderr)
 
             try:
@@ -361,4 +381,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    print("hello")
