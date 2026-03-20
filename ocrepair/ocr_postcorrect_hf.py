@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-OCR post-correction via Hugging Face Inference API using the cheapest provider.
+OCR post-correction via Hugging Face Inference API.
 
-Uses the model suffix :cheapest so the HF router selects the lowest-cost provider
-(lowest price per output token). Requires HF_TOKEN with Inference Providers permission.
+Requires HF_TOKEN with Inference Providers permission (prompted if not set).
+Optionally pass --cheapest to route to the lowest-cost provider.
 
 Usage:
   export HF_TOKEN=your_token
@@ -11,15 +11,19 @@ Usage:
   python ocr_postcorrect_hf.py input.json --model mistral3 -j out.json -c out.csv
   python ocr_postcorrect_hf.py --list-models
   python ocr_postcorrect_hf.py input.json --run-all --output-dir ./results
+  python ocr_postcorrect_hf.py input.jsonl --jsonl -j out.jsonl -c out.csv --model mistral3
+  python ocr_postcorrect_hf.py input.jsonl -j out.jsonl -c out.csv --model mistral3 --batch-size 10
 """
 
-import argparse  # for parsing command-line arguments
-import json      # for reading/writing JSON files
-import os        # for environment variables and file paths
-import sys       # for stderr output and exit codes
+import argparse
+import getpass
+import json
+import os
+import sys
+import time
 
 try:
-    from dotenv import load_dotenv  # for environment variables from .env  # ty:ignore[unresolved-import]
+    from dotenv import load_dotenv  # ty:ignore[unresolved-import]
     if "HF_TOKEN" not in os.environ:
         load_dotenv()
 except ImportError:
@@ -36,90 +40,88 @@ MODEL_REGISTRY = {
     "deepseek-v3.2": "deepseek-ai/DeepSeek-V3.2",
 }
 
-# The full system prompt sent to the model.
-# It instructs the model to:
-#   1) correct OCR tokens in the JSON (fill "ocr_postcorrection_output")
-#   2) produce a CSV corrections log (after the marker CORRECTIONS_CSV)
-#   3) produce a discovered error types section (after the marker DISCOVERED_ERRORS)
-SYSTEM_PROMPT = """You are an expert in historical OCR post-correction for newspapers and books from the 17th to 20th century in English, French and German. You will receive a JSON containing OCR tokens from historical newspapers. 
-STEP 1 - Your task: 
-1. Read the "ocr_hypothesis" field in each token
-2. Correct OCR errors and write the corrected text into "ocr_postcorrection_output"
-3. Do NOT modify any other field in the JSON
-4. Do NOT alter person names or place names
-5. Check the "language" field and correct only within that language — do not translate or deviate
-6. Pay close attention to accented characters — preserve or restore them correctly
-7. Fix four classes of common historical OCR errors:
-- Over-segmentation: words being broken across lines to fit within the margins and hyphens being replaced with spaces e.g. [incorrect] "before the follow ing morning" -> [corrected] "before the follow-ing morning"
-- Under-segmentation: spaces being removed between words e.g. [incorrect] "Two Closes of Rich oldSwarth LAND" -> [corrected] "Two Closes of Rich old Swarth LAND"
-- Misrecognized character: e.g. [incorrect] "aſter" -> [corrected] "after"; [incorrect] "We sailed from Kalaniita Bay, ar.d soon we made the coast" -> [corrected] "We sailed from Kalaniita Bay, and soon we made the coast"
-- Missing character: e.g. [incorrect] "er a good deal of argument, the facts were agreed" -> [corrected] "After a good deal of argument, the facts were agreed"
-8. If a token is too ambiguous to correct confidently, copy the ocr_hypothesis unchanged into ocr_postcorrection_output
-9. Return ONLY the modified JSON. No explanation, no preamble, no markdown fences.
+SYSTEM_PROMPT = """You are an expert in historical OCR post-correction for newspapers and books from the 17th to 20th century in English, French and German.
 
-STEP 2 — After the corrected JSON, output a CSV corrections log.
-The CSV must have exactly these columns:
-token_id,ocr_hypothesis,ocr_postcorrection_output,error_type,confidence,uncertain_chars,notes
+You will receive a JSON array. Each element has:
+- "document_id": a unique identifier
+- "language": the language of the text
+- "ocr_hypothesis": the raw OCR text to correct
 
-Rules for the CSV:
-- error_type: use one of these known types when they apply: over_segmentation, misrecognized_char, under_segmentation, missing_character, wrong_word, uncertain, no_change
-- If the error does not fit any known type, invent a descriptive snake_case label and prefix it with "custom:" (e.g. custom:long_s_substitution, custom:ink_bleed_merge, custom:ligature_ct). Be specific — do not use generic custom labels like custom:other.
-- You may assign multiple error types to one token by separating them with a pipe character | (e.g. broken_hyphen|spacing or garbled_char|custom:long_s_substitution)
-- confidence must be: high, medium, or low
-- uncertain_chars: copy the corrected text but wrap every character you are unsure about in angle brackets ⟨⟩. If fully confident, leave empty. Examples: "t⟨h⟩e" means the h is uncertain; "⟨J⟩ustice" means the capital J is uncertain; "" means full confidence.
-- notes is a short free-text explanation (no commas inside notes — use semicolons instead)
-- Include one row per token, even if no change was made (use no_change)
+Your task:
+1. Correct OCR errors in "ocr_hypothesis" and write the result into a new field "ocr_postcorrection_output"
+2. Do NOT alter person names or place names
+3. Correct only within the given "language" — do not translate
+4. Preserve or restore accented characters correctly
+5. Fix four classes of common historical OCR errors:
+- Over-segmentation: words broken across lines; hyphens replaced with spaces e.g. "before the follow ing morning" -> "before the follow-ing morning"
+- Under-segmentation: missing spaces between words e.g. "Rich oldSwarth LAND" -> "Rich old Swarth LAND"
+- Misrecognized character: e.g. "aſter" -> "after"; "ar.d" -> "and"
+- Missing character: e.g. "er a good deal" -> "After a good deal"
+6. If too ambiguous, copy ocr_hypothesis unchanged
+
+Return a JSON array where each element has exactly: "document_id", "ocr_postcorrection_output"
+Return ONLY valid JSON. No explanation, no preamble, no markdown fences.
+
+After the JSON array, output a CSV corrections log.
+Marker line: CORRECTIONS_CSV
+Columns: document_id,ocr_hypothesis_snippet,ocr_postcorrection_snippet,error_type,confidence,notes
+- error_type: over_segmentation, misrecognized_char, under_segmentation, missing_character, wrong_word, uncertain, no_change, or custom:label
+- confidence: high, medium, or low
+- One row per document_id (use no_change if unchanged)
 - Do not wrap the CSV in markdown fences
 
-STEP 3 — After the CSV, output a discovered error types section.
-Format it exactly like this:
+After the CSV:
 DISCOVERED_ERRORS
 custom_label|count|example|description
-(one row per unique custom: type found, with how many tokens used it, a short example, and a plain English description of the error pattern)
-Do not wrap in markdown fences.
-
-Output format — follow this structure exactly:
-1. The corrected JSON (no markdown fences)
-2. A blank line
-3. The text: CORRECTIONS_CSV
-4. The CSV rows
-5. A blank line
-6. The text: DISCOVERED_ERRORS
-7. The discovered error rows (only if custom: types were used; otherwise write DISCOVERED_ERRORS then "none")"""
+(or "none" if no custom types)"""
 
 
 def get_client():
     """Create and return a Hugging Face InferenceClient, authenticated with HF_TOKEN."""
-    from huggingface_hub import InferenceClient  # HF's Python SDK for inference  # ty:ignore[unresolved-import]
+    from huggingface_hub import InferenceClient  # ty:ignore[unresolved-import]
 
-    # Read the token from the environment variable
     token = os.environ.get("HF_TOKEN")
     if not token:
-        # Abort early with a helpful message if no token is set
-        raise SystemExit(
-            "HF_TOKEN is required. Create a token at https://huggingface.co/settings/tokens "
-            "with 'Make calls to Inference Providers' and set: export HF_TOKEN=..."
+        token = getpass.getpass(
+            "HF_TOKEN not found in environment. Enter your Hugging Face token: "
         )
-    # Return an authenticated client; all API calls will use this token
-    return InferenceClient(api_key=token)
+        if not token.strip():
+            raise SystemExit(
+                "No token provided. Create one at https://huggingface.co/settings/tokens "
+                "with 'Make calls to Inference Providers'."
+            )
+    return InferenceClient(api_key=token.strip())
+
+
+MAX_RETRIES = 3
+RETRY_BACKOFF = [30, 60, 120]  # seconds to wait between retries
 
 
 def chat_completion(client, model: str, messages: list, **kwargs):
-    """
-    Send a chat completion request and return the model's text response.
-    `client`   — the InferenceClient from get_client()
-    `model`    — full HF model ID, possibly with :cheapest suffix
-    `messages` — list of {"role": ..., "content": ...} dicts (system + user)
-    `**kwargs` — extra params forwarded to the API (max_tokens, temperature, etc.)
-    """
-    # Call the HF chat completions endpoint (OpenAI-compatible format)
-    result = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        **kwargs,
-    )
-    # The response contains a list of choices; we take the first one's text content
-    return result.choices[0].message.content
+    """Send a chat completion request with automatic retries on timeout."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            result = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **kwargs,
+            )
+            return result.choices[0].message.content
+        except Exception as e:
+            err_str = str(e).lower()
+            is_retryable = any(
+                kw in err_str
+                for kw in ("timeout", "gateway", "502", "503", "504", "529")
+            )
+            if not is_retryable or attempt == MAX_RETRIES:
+                raise
+            wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+            print(
+                f"  Timeout/server error (attempt {attempt + 1}/{MAX_RETRIES + 1}), "
+                f"retrying in {wait}s: {e}",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
 
 
 def resolve_model(name_or_id: str) -> str:
@@ -165,18 +167,31 @@ def parse_response(response: str):
     return json_raw, csv_section, discovered_section
 
 
+def _csv_body_lines(csv_section: str) -> tuple[str | None, list[str]]:
+    """Split CSV text into header (first line) and data lines."""
+    lines = [ln for ln in csv_section.strip().splitlines() if ln.strip()]
+    if not lines:
+        return None, []
+    return lines[0], lines[1:]
+
+
 def main():
     # ── Argument parser ──────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
-        description="OCR post-correction via Hugging Face (cheapest provider)"
+        description="OCR post-correction via Hugging Face Inference API"
     )
-    # Positional: the input JSON file containing OCR tokens
+    # Positional: path to JSON or JSONL file containing OCR tokens
     parser.add_argument(
         "input_json",
         nargs="?",                                     # optional so --list-models works without it
-        type=argparse.FileType("r", encoding="utf-8"), # opens the file for reading
+        type=str,
         default=None,
-        help="Path to JSON file with OCR tokens (must contain ocr_hypothesis per token)",
+        help="Path to JSON or JSONL file with OCR tokens (ocr_hypothesis per token)",
+    )
+    parser.add_argument(
+        "--jsonl",
+        action="store_true",
+        help="Read input as JSON Lines (one JSON object per line). Outputs are JSONL when using -j.",
     )
     # -j: where to write the corrected JSON (same structure as input)
     parser.add_argument(
@@ -206,7 +221,7 @@ def main():
     parser.add_argument(
         "--model",
         default=os.environ.get("OCR_HF_MODEL", ""),   # can also be set via env var
-        help="Model: short name (e.g. qwen3.5-397b-a17b, mistral3, gemma3, deepseek-v3.2) or full HF ID. :cheapest appended unless --no-cheapest.",
+        help="Model: short name (e.g. qwen3.5-397b-a17b, mistral3, gemma3, deepseek-v3.2) or full HF ID.",
     )
     # --list-models: print the registry and exit
     parser.add_argument(
@@ -227,20 +242,24 @@ def main():
         default=None,
         help="Directory for --run-all outputs (default: current dir).",
     )
-    # --no-cheapest: skip the :cheapest suffix (use HF's default routing = fastest)
     parser.add_argument(
-        "--no-cheapest",
+        "--cheapest",
         action="store_true",
-        help="Do not append :cheapest to model (use default/fastest provider)",
+        help="Append :cheapest to model ID so HF routes to the lowest-cost provider",
     )
-    # --max-tokens: cap on how many tokens the model can generate
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="For JSONL input: send this many records per API call (default: 1). "
+             "Increase to 3-5 if your records are small. Set to 0 for all in one call.",
+    )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=8192,
-        help="Max tokens for completion (default: 8192)",
+        default=16384,
+        help="Max tokens for completion (default: 16384)",
     )
-    # --temperature: controls randomness; low = more deterministic
     parser.add_argument(
         "--temperature",
         type=float,
@@ -263,124 +282,253 @@ def main():
     if not args.model and not args.run_all:
         parser.error("--model is required (or set OCR_HF_MODEL, or use --run-all). Use --list-models to see options.")
 
-    # ── Load input JSON and build the messages for the model ─────────────
-    with args.input_json as f:     # read and parse the input JSON file
-        payload = json.load(f)
+    input_path = args.input_json
+    use_jsonl = args.jsonl or input_path.endswith(".jsonl")
+    batch_size = args.batch_size
 
-    # Serialise the JSON payload as a compact string to send as the user message
-    user_content = json.dumps(payload, ensure_ascii=False, indent=0)
+    # ── helpers ──────────────────────────────────────────────────────────
 
-    # Build the chat messages: system prompt (instructions) + user message (the data)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},  # tells the model what to do
-        {"role": "user", "content": user_content},      # the actual OCR tokens to correct
-    ]
+    def _load_input(path: str, jsonl: bool):
+        """Load input. JSONL → list of dicts; JSON → single object/array."""
+        with open(path, encoding="utf-8") as f:
+            if jsonl:
+                records = []
+                for line_no, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        print(f"Skip line {line_no}: invalid JSON: {e}", file=sys.stderr)
+                return records
+            return json.load(f)
 
-    # ── --run-all branch: loop through every registered model ────────────
+    def _slim_extract(records):
+        """Extract lightweight payload: only document_id + language + ocr_hypothesis text."""
+        slim_records = []
+        for rec in records:
+            doc_id = rec.get("document_metadata", {}).get("document_id", "unknown")
+            lang = rec.get("document_metadata", {}).get("language", "en")
+            hyp = rec.get("ocr_hypothesis", {})
+            hyp_text = hyp.get("transcription_unit", "") if isinstance(hyp, dict) else str(hyp)
+            slim_records.append({
+                "document_id": doc_id,
+                "language": lang,
+                "ocr_hypothesis": hyp_text,
+            })
+        return slim_records
+
+    def _slim_reinject(original_records, corrections):
+        """Merge model corrections back into original records by document_id order."""
+        correction_map = {}
+        for corr in corrections:
+            doc_id = corr.get("document_id")
+            text = corr.get("ocr_postcorrection_output", "")
+            if doc_id:
+                correction_map[doc_id] = text
+
+        merged = []
+        for rec in original_records:
+            rec = json.loads(json.dumps(rec))  # deep copy
+            doc_id = rec.get("document_metadata", {}).get("document_id")
+            corrected_text = correction_map.get(doc_id)
+            if corrected_text is None and corrections:
+                idx = len(merged)
+                if idx < len(corrections):
+                    corrected_text = corrections[idx].get("ocr_postcorrection_output", "")
+
+            if corrected_text is not None:
+                if isinstance(rec.get("ocr_postcorrection_output"), dict):
+                    rec["ocr_postcorrection_output"]["transcription_unit"] = corrected_text
+                else:
+                    rec["ocr_postcorrection_output"] = corrected_text
+            merged.append(rec)
+        return merged
+
+    def _build_messages(payload):
+        user_content = json.dumps(payload, ensure_ascii=False, indent=0)
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+    def _run_model(client, model_id, payload, max_tokens, temperature):
+        """Single API call: send payload, return (json_raw, csv_section, response)."""
+        messages = _build_messages(payload)
+        response = chat_completion(
+            client, model_id, messages,
+            max_tokens=max_tokens, temperature=temperature,
+        )
+        json_raw, csv_section, _ = parse_response(response)
+        return json_raw, csv_section, response
+
+    def _make_batches(records, size):
+        """Split a list into batches. size=0 means one batch with everything."""
+        if size <= 0:
+            return [records]
+        return [records[i:i + size] for i in range(0, len(records), size)]
+
+    def _run_batched(client, model_id, records, max_tokens, temperature, label=""):
+        """Run model on batches of slim payloads; re-inject corrections into
+        the original records. Returns (all_results, merged_csv, raw_responses).
+        """
+        send_records = _slim_extract(records)
+        batches = _make_batches(send_records, batch_size)
+        n_calls = len(batches)
+        print(
+            f"  {label}{len(records)} records in {n_calls} batch(es) "
+            f"(batch_size={batch_size or 'all'})",
+            file=sys.stderr,
+        )
+
+        all_corrections = []
+        csv_header = None
+        csv_data_lines = []
+        raw_responses = []
+
+        for batch_idx, batch in enumerate(batches, 1):
+            if batch_idx > 1:
+                time.sleep(3)
+            print(
+                f"  Batch {batch_idx}/{n_calls} ({len(batch)} records)...",
+                file=sys.stderr,
+            )
+            json_raw, csv_section, response = _run_model(
+                client, model_id, batch, max_tokens, temperature,
+            )
+            raw_responses.append(response)
+
+            result = json.loads(json_raw)
+            if isinstance(result, list):
+                all_corrections.extend(result)
+            else:
+                all_corrections.append(result)
+
+            hdr, rows = _csv_body_lines(csv_section)
+            if hdr and csv_header is None:
+                csv_header = hdr
+            csv_data_lines.extend(rows)
+
+        merged_csv = ""
+        if csv_header:
+            merged_csv = csv_header + "\n" + "\n".join(csv_data_lines)
+            if not merged_csv.endswith("\n"):
+                merged_csv += "\n"
+
+        all_results = _slim_reinject(records, all_corrections)
+        return all_results, merged_csv, raw_responses
+
+    def _write_json(path, result, is_jsonl):
+        with open(path, "w", encoding="utf-8") as f:
+            if is_jsonl and isinstance(result, list):
+                for obj in result:
+                    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            else:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+
+    # ── Load input ───────────────────────────────────────────────────────
+    payload = _load_input(input_path, use_jsonl)
+    n_records = len(payload) if isinstance(payload, list) else 1
+    print(f"Loaded {n_records} record(s) from {input_path}", file=sys.stderr)
+
+    # ── --run-all branch ─────────────────────────────────────────────────
     if args.run_all:
-        out_dir = args.output_dir or os.getcwd()  # default output dir = current directory
+        out_dir = args.output_dir or os.getcwd()
         if not os.path.exists(out_dir):
-            os.makedirs(out_dir, exist_ok=False)        # create dir if it doesn't exist
+            os.makedirs(out_dir, exist_ok=False)
 
-        client = get_client()  # one client for all requests (same token)
+        client = get_client()
 
         for short_name, full_id in MODEL_REGISTRY.items():
-            # Append :cheapest to route to the cheapest provider, unless disabled
-            mid = f"{full_id}:cheapest" if not args.no_cheapest else full_id
-
-            # Build output file paths: one .json and one .csv per model
-            json_path = os.path.join(out_dir, f"hipe-ocrepair-bench_v0.9_{short_name}.json")
+            mid = f"{full_id}:cheapest" if args.cheapest else full_id
+            ext = "jsonl" if use_jsonl else "json"
+            json_path = os.path.join(out_dir, f"hipe-ocrepair-bench_v0.9_{short_name}.{ext}")
             csv_path = os.path.join(out_dir, f"hipe-ocrepair-bench_v0.9_{short_name}.csv")
             print(f"Running {short_name} ({mid}) -> {json_path}, {csv_path}", file=sys.stderr)
 
             try:
-                # Send the request to this model
-                response = chat_completion(
-                    client, mid, messages,
-                    max_tokens=args.max_tokens,
-                    temperature=args.temperature,
-                )
-                try:
-                    # Split the response into JSON, CSV, and discovered sections
-                    json_raw, csv_section, _ = parse_response(response)
-
-                    # Write the corrected JSON (parsed then re-serialised for clean formatting)
-                    with open(json_path, "w", encoding="utf-8") as f:
-                        json.dump(json.loads(json_raw), f, ensure_ascii=False, indent=2)
-
-                    # Write the CSV corrections log
+                if use_jsonl and isinstance(payload, list):
+                    all_results, merged_csv, _ = _run_batched(
+                        client, mid, payload, args.max_tokens, args.temperature,
+                        label=f"[{short_name}] ",
+                    )
+                    _write_json(json_path, all_results, is_jsonl=True)
+                    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                        f.write(merged_csv)
+                else:
+                    json_raw, csv_section, _ = _run_model(
+                        client, mid, payload, args.max_tokens, args.temperature,
+                    )
+                    _write_json(json_path, json.loads(json_raw), is_jsonl=False)
                     with open(csv_path, "w", encoding="utf-8", newline="") as f:
                         f.write(csv_section)
                         if csv_section and not csv_section.endswith("\n"):
-                            f.write("\n")  # ensure file ends with a newline
-
-                except (json.JSONDecodeError, ValueError) as e:
-                    # If the model's JSON was malformed, log but continue with next model
-                    print(f"  Could not parse response: {e}", file=sys.stderr)
-
+                            f.write("\n")
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"  Could not parse response: {e}", file=sys.stderr)
             except Exception as e:
-                # If the API call itself failed, log and continue with next model
                 print(f"  Error: {e}", file=sys.stderr)
 
         return  # done with --run-all
 
     # ── Single-model branch ──────────────────────────────────────────────
 
-    # Resolve short name to full HF model ID (e.g. "mistral3" -> "mistralai/...")
     model_id = resolve_model(args.model)
-    # Append :cheapest so HF routes to the lowest-cost provider, unless disabled
-    if not args.no_cheapest and ":" not in model_id:
+    if args.cheapest and ":" not in model_id:
         model_id = f"{model_id}:cheapest"
 
-    # Create the HF client and send the request
     client = get_client()
-    try:
-        response = chat_completion(
-            client,
-            model_id,
-            messages,
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
+
+    if not any([args.output_json, args.output_csv, args.output_raw]):
+        print(
+            "No output requested: use -j (JSON/JSONL), -c (CSV), and/or -o (raw). "
+            "Example: -j out.jsonl -c corrections.csv",
+            file=sys.stderr,
         )
+
+    try:
+        if use_jsonl and isinstance(payload, list):
+            all_results, merged_csv, raw_responses = _run_batched(
+                client, model_id, payload, args.max_tokens, args.temperature,
+            )
+            if args.output_raw:
+                for i, resp in enumerate(raw_responses, 1):
+                    args.output_raw.write(f"=== batch {i} ===\n{resp}\n")
+                args.output_raw.close()
+                print("Raw output written to", args.output_raw.name, file=sys.stderr)
+            if args.output_json:
+                _write_json(args.output_json, all_results, is_jsonl=True)
+                print("Corrected JSONL written to", args.output_json, file=sys.stderr)
+            if args.output_csv:
+                with open(args.output_csv, "w", encoding="utf-8", newline="") as f:
+                    f.write(merged_csv)
+                print("Corrections CSV written to", args.output_csv, file=sys.stderr)
+        else:
+            json_raw, csv_section, response = _run_model(
+                client, model_id, payload, args.max_tokens, args.temperature,
+            )
+            if args.output_raw:
+                args.output_raw.write(response)
+                args.output_raw.close()
+                print("Raw output written to", args.output_raw.name, file=sys.stderr)
+            if args.output_json:
+                _write_json(args.output_json, json.loads(json_raw), is_jsonl=False)
+                print("Corrected JSON written to", args.output_json, file=sys.stderr)
+            if args.output_csv:
+                with open(args.output_csv, "w", encoding="utf-8", newline="") as f:
+                    f.write(csv_section)
+                    if csv_section and not csv_section.endswith("\n"):
+                        f.write("\n")
+                print("Corrections CSV written to", args.output_csv, file=sys.stderr)
+
+    except (json.JSONDecodeError, ValueError) as e:
+        print("Could not parse model response:", e, file=sys.stderr)
+        raise SystemExit(1)
     except Exception as e:
         print("Inference error:", e, file=sys.stderr)
         raise SystemExit(1)
 
-    # Warn if the user didn't request any output files
-    if not any([args.output_json, args.output_csv, args.output_raw]):
-        print("No output requested: use -j (JSON), -c (CSV), and/or -o (raw). Example: -j out.json -c corrections.csv", file=sys.stderr)
-
-    # Optionally save the full raw model response (JSON + CSV + DISCOVERED_ERRORS as one text blob)
-    if args.output_raw:
-        args.output_raw.write(response)  # write entire response as-is
-        args.output_raw.close()
-        print("Raw output written to", args.output_raw.name, file=sys.stderr)
-
-    # Parse the response and write the structured output files
-    try:
-        # Split model output into the three sections
-        json_raw, csv_section, _ = parse_response(response)
-
-        # -j: write the corrected JSON (same structure as input, with ocr_postcorrection_output filled)
-        if args.output_json:
-            with open(args.output_json, "w", encoding="utf-8") as f:
-                json.dump(json.loads(json_raw), f, ensure_ascii=False, indent=2)
-            print("Corrected JSON written to", args.output_json, file=sys.stderr)
-
-        # -c: write the corrections CSV log
-        if args.output_csv:
-            with open(args.output_csv, "w", encoding="utf-8", newline="") as f:
-                f.write(csv_section)
-                if csv_section and not csv_section.endswith("\n"):
-                    f.write("\n")  # ensure file ends with a newline
-            print("Corrections CSV written to", args.output_csv, file=sys.stderr)
-
-    except (json.JSONDecodeError, ValueError) as e:
-        # If the model response couldn't be parsed, exit with error
-        print("Could not parse model response:", e, file=sys.stderr)
-        raise SystemExit(1)
-
 
 if __name__ == "__main__":
-    # main()
-    print("hello")
+    main()
