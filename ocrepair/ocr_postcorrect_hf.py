@@ -51,7 +51,7 @@ STEP 1 - Your task:
 6. Pay close attention to accented characters — preserve or restore them correctly
 7. Fix four classes of common historical OCR errors:
 - Over-segmentation: words being broken across lines to fit within the margins and hyphens being replaced with spaces e.g. [incorrect] "before the follow ing morning" -> [corrected] "before the follow-ing morning"
-- Under-segementation: spaces being removed between words e.g. [incorrect] "Two Closes of Rich oldSwarth LAND" -> [corrected] "Two Closes of Rich old Swarth LAND"
+- Under-segmentation: spaces being removed between words e.g. [incorrect] "Two Closes of Rich oldSwarth LAND" -> [corrected] "Two Closes of Rich old Swarth LAND"
 - Misrecognized character: e.g. [incorrect] "aſter" -> [corrected] "after"; [incorrect] "We sailed from Kalaniita Bay, ar.d soon we made the coast" -> [corrected] "We sailed from Kalaniita Bay, and soon we made the coast"
 8. If a token is too ambiguous to correct confidently, copy the ocr_hypothesis unchanged into ocr_postcorrection_output
 9. Return ONLY the modified JSON. No explanation, no preamble, no markdown fences.
