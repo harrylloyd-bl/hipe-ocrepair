@@ -41,7 +41,7 @@ MODEL_REGISTRY = {
 #   1) correct OCR tokens in the JSON (fill "ocr_postcorrection_output")
 #   2) produce a CSV corrections log (after the marker CORRECTIONS_CSV)
 #   3) produce a discovered error types section (after the marker DISCOVERED_ERRORS)
-SYSTEM_PROMPT = """You are an expert in historical OCR post-correction for newspapers from the 17th to 20th century in English. You will receive a JSON containing OCR tokens from historical newspapers. 
+SYSTEM_PROMPT = """You are an expert in historical OCR post-correction for newspapers and books from the 17th to 20th century in English, French and German. You will receive a JSON containing OCR tokens from historical newspapers. 
 STEP 1 - Your task: 
 1. Read the "ocr_hypothesis" field in each token
 2. Correct OCR errors and write the corrected text into "ocr_postcorrection_output"
