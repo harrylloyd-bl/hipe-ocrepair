@@ -98,7 +98,11 @@ RETRY_BACKOFF = [30, 60, 120]  # seconds to wait between retries
 
 
 def chat_completion(client, model: str, messages: list, **kwargs):
-    """Send a chat completion request with automatic retries on timeout."""
+    """Send a chat completion request with automatic retries on timeout.
+
+    Returns (content, finish_reason).  finish_reason is typically "stop"
+    (complete) or "length" (output was truncated by max_tokens).
+    """
     for attempt in range(MAX_RETRIES + 1):
         try:
             result = client.chat.completions.create(
@@ -106,12 +110,14 @@ def chat_completion(client, model: str, messages: list, **kwargs):
                 messages=messages,
                 **kwargs,
             )
-            return result.choices[0].message.content
+            choice = result.choices[0]
+            return choice.message.content, getattr(choice, "finish_reason", "stop")
         except Exception as e:
             err_str = str(e).lower()
             is_retryable = any(
                 kw in err_str
-                for kw in ("timeout", "gateway", "502", "503", "504", "529")
+                for kw in ("timeout", "gateway", "502", "503", "504", "529",
+                           "prematurely", "connection", "reset", "broken pipe")
             )
             if not is_retryable or attempt == MAX_RETRIES:
                 raise
@@ -134,35 +140,175 @@ def resolve_model(name_or_id: str) -> str:
     return MODEL_REGISTRY.get(key, name_or_id.strip())  # fallback to original if not found
 
 
-def parse_response(response: str):
-    """
-    Split the raw model output into three parts using the section markers
-    we asked for in the prompt:
-      1. json_raw         — the corrected JSON (as a string, ready to json.loads)
-      2. csv_section      — the CSV corrections log (text between CORRECTIONS_CSV and DISCOVERED_ERRORS)
-      3. discovered_section — the discovered error types (text after DISCOVERED_ERRORS)
-    """
-    # --- Step 1: separate the JSON from everything after CORRECTIONS_CSV ---
-    parts = response.split("CORRECTIONS_CSV", 1)  # split at most once
-    json_raw = parts[0].strip()                    # everything before the marker = JSON
-    rest = parts[1].strip() if len(parts) > 1 else ""  # everything after = CSV + DISCOVERED
-
-    # --- Step 2: strip markdown code fences if the model wrapped the JSON in them ---
-    if json_raw.startswith("```"):
-        lines = json_raw.split("\n")
-        if lines[0].startswith("```"):     # remove opening fence line (e.g. ```json)
+def _strip_fences(text: str) -> str:
+    """Remove markdown code fences (```json ... ```) if present."""
+    s = text.strip()
+    if s.startswith("```"):
+        lines = s.split("\n")
+        if lines[0].startswith("```"):
             lines = lines[1:]
-        if lines and lines[-1].strip() == "```":  # remove closing fence line
+        if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
-        json_raw = "\n".join(lines)        # rejoin without the fences
+        s = "\n".join(lines).strip()
+    return s
 
-    # --- Step 3: split the remainder into CSV and DISCOVERED_ERRORS sections ---
+
+_json_decoder = json.JSONDecoder()
+
+
+def _safe_json_parse(text: str):
+    """Parse the first complete JSON value from *text*, ignoring trailing data."""
+    text = text.lstrip()
+    if not text:
+        return None
+    try:
+        obj, _ = _json_decoder.raw_decode(text)
+        return obj
+    except json.JSONDecodeError:
+        return None
+
+
+def _repair_truncated_json(raw: str):
+    """Try to repair JSON truncated mid-stream by closing open brackets/braces.
+
+    Works for the common case where the model hit max_tokens and the response
+    was cut off inside a JSON array of objects — even if the cut happens
+    mid-string-value.  Returns the parsed object or None if not feasible.
+    """
+    s = raw.rstrip()
+    if not s:
+        return None
+
+    # Quick check: maybe valid JSON followed by trailing text
+    result = _safe_json_parse(s)
+    if result is not None:
+        return result
+
+    # Pass 1: parse to determine state at end of string
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in s:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in ("{", "["):
+            stack.append(ch)
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+
+    if not in_string and not stack:
+        return _safe_json_parse(s)
+
+    # Pass 2: build the suffix to close everything
+    closers = {"[": "]", "{": "}"}
+    suffix = ""
+    if in_string:
+        suffix += '"'
+    suffix += "".join(closers[opener] for opener in reversed(stack))
+
+    repaired = s + suffix
+    result = _safe_json_parse(repaired)
+    if result is not None:
+        return result
+
+    # Fallback: walk back to the last complete key-value pair, then close.
+    for cut in range(len(s) - 1, max(0, len(s) - 2000), -1):
+        candidate = s[:cut + 1].rstrip().rstrip(",")
+        st: list[str] = []
+        ins = False
+        esc = False
+        for ch in candidate:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                ins = not ins
+                continue
+            if ins:
+                continue
+            if ch in ("{", "["):
+                st.append(ch)
+            elif ch == "}":
+                if st and st[-1] == "{":
+                    st.pop()
+            elif ch == "]":
+                if st and st[-1] == "[":
+                    st.pop()
+        if ins:
+            continue
+        fix = candidate + "".join(closers[o] for o in reversed(st))
+        result = _safe_json_parse(fix)
+        if result is not None:
+            return result
+
+    return None
+
+
+def _try_parse_json(raw: str):
+    """Parse JSON, handling cases where the model returns multiple objects
+    instead of a proper array (Extra data error), and attempting repair
+    on truncated output."""
+    raw = _strip_fences(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt repair (truncated / trailing-data output)
+    result = _repair_truncated_json(raw)
+    if result is not None:
+        n = len(result) if isinstance(result, list) else 1
+        print(f"  (repaired truncated JSON — recovered {n} record(s))",
+              file=sys.stderr)
+        return result
+    elif raw.strip():
+        print(f"  (JSON repair could not fix output, "
+              f"raw ends with: ...{raw[-80:]!r})", file=sys.stderr)
+
+    # Model may have returned one JSON object per line instead of an array
+    objects = []
+    for line in raw.splitlines():
+        line = line.strip().rstrip(",")
+        if not line:
+            continue
+        try:
+            objects.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if objects:
+        return objects
+    raise json.JSONDecodeError("Could not parse model JSON output", raw, 0)
+
+
+def parse_response(response: str):
+    """Split model output into (json_raw, csv_section, discovered_section).
+    Returns the raw JSON string — use _try_parse_json() to parse it."""
+    parts = response.split("CORRECTIONS_CSV", 1)
+    json_raw = _strip_fences(parts[0].strip())
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
     csv_section = ""
     discovered_section = ""
     if rest:
-        parts2 = rest.split("DISCOVERED_ERRORS", 1)  # split at most once
-        csv_section = parts2[0].strip()               # text before marker = CSV rows
-        discovered_section = parts2[1].strip() if len(parts2) > 1 else ""  # text after = discovered
+        parts2 = rest.split("DISCOVERED_ERRORS", 1)
+        csv_section = parts2[0].strip()
+        discovered_section = parts2[1].strip() if len(parts2) > 1 else ""
 
     return json_raw, csv_section, discovered_section
 
@@ -255,6 +401,13 @@ def main():
              "Increase to 3-5 if your records are small. Set to 0 for all in one call.",
     )
     parser.add_argument(
+        "--batches",
+        type=str,
+        default=None,
+        help="Comma-separated list of 1-indexed batch numbers to run "
+             "(e.g. --batches 1,5,10,20,21,23). Skipped batches pass through uncorrected.",
+    )
+    parser.add_argument(
         "--max-tokens",
         type=int,
         default=16384,
@@ -285,6 +438,9 @@ def main():
     input_path = args.input_json
     use_jsonl = args.jsonl or input_path.endswith(".jsonl")
     batch_size = args.batch_size
+    only_batches = None
+    if args.batches:
+        only_batches = set(int(b.strip()) for b in args.batches.split(",") if b.strip())
 
     # ── helpers ──────────────────────────────────────────────────────────
 
@@ -353,14 +509,69 @@ def main():
             {"role": "user", "content": user_content},
         ]
 
+    MAX_TRUNCATION_RETRIES = 1
+    MAX_OUTPUT_TOKENS_CAP = 30000
+
     def _run_model(client, model_id, payload, max_tokens, temperature):
-        """Single API call: send payload, return (json_raw, csv_section, response)."""
+        """Single API call with automatic retry on truncation.
+
+        If the model's response is truncated (finish_reason == "length" or
+        heuristic), retries once with capped higher max_tokens.
+        Returns (json_raw, csv_section, response).
+        """
+        current_max_tokens = max_tokens
         messages = _build_messages(payload)
-        response = chat_completion(
-            client, model_id, messages,
-            max_tokens=max_tokens, temperature=temperature,
-        )
-        json_raw, csv_section, _ = parse_response(response)
+
+        for attempt in range(1 + MAX_TRUNCATION_RETRIES):
+            try:
+                response, finish_reason = chat_completion(
+                    client, model_id, messages,
+                    max_tokens=current_max_tokens, temperature=temperature,
+                )
+            except Exception as e:
+                if "maximum context length" in str(e) or "bad_request" in str(e).lower():
+                    print(
+                        f"  Context window exceeded at max_tokens={current_max_tokens}, "
+                        f"skipping retry.",
+                        file=sys.stderr,
+                    )
+                raise
+
+            json_raw, csv_section, _ = parse_response(response)
+
+            # Detect truncation: via API finish_reason or heuristic
+            truncated = (finish_reason or "").lower() in ("length",)
+            if not truncated and json_raw:
+                stripped = json_raw.rstrip()
+                if stripped and stripped[-1] not in ("}", "]"):
+                    truncated = True
+            if truncated and attempt < MAX_TRUNCATION_RETRIES:
+                new_tokens = min(current_max_tokens * 2, MAX_OUTPUT_TOKENS_CAP)
+                if new_tokens <= current_max_tokens:
+                    print(
+                        f"  Response truncated but already at token cap "
+                        f"({current_max_tokens}). Attempting JSON repair...",
+                        file=sys.stderr,
+                    )
+                    break
+                current_max_tokens = new_tokens
+                print(
+                    f"  Response truncated (finish_reason={finish_reason}), "
+                    f"retrying with max_tokens={current_max_tokens}...",
+                    file=sys.stderr,
+                )
+                time.sleep(3)
+                continue
+
+            if truncated:
+                print(
+                    f"  Response still truncated after {attempt + 1} attempt(s) "
+                    f"(max_tokens={current_max_tokens}). Attempting JSON repair...",
+                    file=sys.stderr,
+                )
+
+            return json_raw, csv_section, response
+        # Fell through from break above
         return json_raw, csv_section, response
 
     def _make_batches(records, size):
@@ -369,46 +580,80 @@ def main():
             return [records]
         return [records[i:i + size] for i in range(0, len(records), size)]
 
-    def _run_batched(client, model_id, records, max_tokens, temperature, label=""):
+    def _run_batched(client, model_id, records, max_tokens, temperature,
+                     label="", only_batches=None):
         """Run model on batches of slim payloads; re-inject corrections into
         the original records. Returns (all_results, merged_csv, raw_responses).
+
+        If *only_batches* is a set of 1-indexed batch numbers, only those
+        batches are sent to the API; the rest are skipped (their records pass
+        through uncorrected).
         """
         send_records = _slim_extract(records)
         batches = _make_batches(send_records, batch_size)
         n_calls = len(batches)
-        print(
-            f"  {label}{len(records)} records in {n_calls} batch(es) "
-            f"(batch_size={batch_size or 'all'})",
-            file=sys.stderr,
-        )
+        if only_batches:
+            run_count = sum(1 for i in range(1, n_calls + 1) if i in only_batches)
+            print(
+                f"  {label}{len(records)} records in {n_calls} batch(es) "
+                f"(batch_size={batch_size or 'all'}), running {run_count} selected batch(es): "
+                f"{sorted(only_batches)}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  {label}{len(records)} records in {n_calls} batch(es) "
+                f"(batch_size={batch_size or 'all'})",
+                file=sys.stderr,
+            )
 
         all_corrections = []
         csv_header = None
         csv_data_lines = []
         raw_responses = []
 
+        failed = 0
         for batch_idx, batch in enumerate(batches, 1):
+            if only_batches and batch_idx not in only_batches:
+                continue
             if batch_idx > 1:
                 time.sleep(3)
             print(
                 f"  Batch {batch_idx}/{n_calls} ({len(batch)} records)...",
                 file=sys.stderr,
             )
-            json_raw, csv_section, response = _run_model(
-                client, model_id, batch, max_tokens, temperature,
+            last_response = ""
+            try:
+                json_raw, csv_section, last_response = _run_model(
+                    client, model_id, batch, max_tokens, temperature,
+                )
+                raw_responses.append(last_response)
+
+                result = _try_parse_json(json_raw)
+                if isinstance(result, list):
+                    all_corrections.extend(result)
+                else:
+                    all_corrections.append(result)
+
+                hdr, rows = _csv_body_lines(csv_section)
+                if hdr and csv_header is None:
+                    csv_header = hdr
+                csv_data_lines.extend(rows)
+            except Exception as e:
+                failed += 1
+                print(
+                    f"  Batch {batch_idx} failed (skipping): {e}",
+                    file=sys.stderr,
+                )
+                if last_response:
+                    preview = last_response[:300].replace("\n", "\\n")
+                    print(f"    Raw response preview: {preview}", file=sys.stderr)
+
+        if failed:
+            print(
+                f"  {failed}/{n_calls} batch(es) failed",
+                file=sys.stderr,
             )
-            raw_responses.append(response)
-
-            result = json.loads(json_raw)
-            if isinstance(result, list):
-                all_corrections.extend(result)
-            else:
-                all_corrections.append(result)
-
-            hdr, rows = _csv_body_lines(csv_section)
-            if hdr and csv_header is None:
-                csv_header = hdr
-            csv_data_lines.extend(rows)
 
         merged_csv = ""
         if csv_header:
@@ -452,6 +697,7 @@ def main():
                     all_results, merged_csv, _ = _run_batched(
                         client, mid, payload, args.max_tokens, args.temperature,
                         label=f"[{short_name}] ",
+                        only_batches=only_batches,
                     )
                     _write_json(json_path, all_results, is_jsonl=True)
                     with open(csv_path, "w", encoding="utf-8", newline="") as f:
@@ -460,7 +706,7 @@ def main():
                     json_raw, csv_section, _ = _run_model(
                         client, mid, payload, args.max_tokens, args.temperature,
                     )
-                    _write_json(json_path, json.loads(json_raw), is_jsonl=False)
+                    _write_json(json_path, _try_parse_json(json_raw), is_jsonl=False)
                     with open(csv_path, "w", encoding="utf-8", newline="") as f:
                         f.write(csv_section)
                         if csv_section and not csv_section.endswith("\n"):
@@ -475,8 +721,19 @@ def main():
     # ── Single-model branch ──────────────────────────────────────────────
 
     model_id = resolve_model(args.model)
+    short_name = args.model.strip().lower()
     if args.cheapest and ":" not in model_id:
         model_id = f"{model_id}:cheapest"
+
+    # If --output-dir is set, auto-generate -j and -c paths with model name
+    if args.output_dir:
+        out_dir = args.output_dir
+        os.makedirs(out_dir, exist_ok=True)
+        ext = "jsonl" if use_jsonl else "json"
+        if not args.output_json:
+            args.output_json = os.path.join(out_dir, f"{short_name}.{ext}")
+        if not args.output_csv:
+            args.output_csv = os.path.join(out_dir, f"{short_name}.csv")
 
     client = get_client()
 
@@ -491,6 +748,7 @@ def main():
         if use_jsonl and isinstance(payload, list):
             all_results, merged_csv, raw_responses = _run_batched(
                 client, model_id, payload, args.max_tokens, args.temperature,
+                only_batches=only_batches,
             )
             if args.output_raw:
                 for i, resp in enumerate(raw_responses, 1):
@@ -513,7 +771,7 @@ def main():
                 args.output_raw.close()
                 print("Raw output written to", args.output_raw.name, file=sys.stderr)
             if args.output_json:
-                _write_json(args.output_json, json.loads(json_raw), is_jsonl=False)
+                _write_json(args.output_json, _try_parse_json(json_raw), is_jsonl=False)
                 print("Corrected JSON written to", args.output_json, file=sys.stderr)
             if args.output_csv:
                 with open(args.output_csv, "w", encoding="utf-8", newline="") as f:
