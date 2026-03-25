@@ -19,6 +19,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
 import time
 
@@ -295,8 +296,8 @@ def _try_parse_json(raw: str):
     raw = _strip_fences(raw)
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
+    except json.JSONDecodeError as first_err:
+        print(f"  (initial json.loads failed: {first_err})", file=sys.stderr)
 
     # Attempt repair (truncated / trailing-data output)
     result = _repair_truncated_json(raw)
@@ -324,19 +325,102 @@ def _try_parse_json(raw: str):
     raise json.JSONDecodeError("Could not parse model JSON output", raw, 0)
 
 
+_FENCED_BLOCK_RE = re.compile(
+    r"```[a-zA-Z]*\s*\n(.*?)```", re.DOTALL
+)
+
+
+def _json_value_start(text: str) -> int | None:
+    """Index of the first ``[`` or ``{`` that can start a JSON value."""
+    for i, ch in enumerate(text):
+        if ch in "[{":
+            return i
+    return None
+
+
+def _split_json_from_rest(text: str) -> tuple[str, str]:
+    """Split *text* into the first complete JSON value and the remainder.
+
+    Uses :meth:`json.JSONDecoder.raw_decode` so delimiters follow JSON
+    string/escape rules (unlike naive bracket counting).  If parsing fails,
+    If parsing fails, returns *text* unchanged and an empty rest string so
+    callers can fall back to repair heuristics.
+    """
+    text = text.strip()
+    if not text:
+        return "", ""
+    start = _json_value_start(text)
+    if start is None:
+        return text, ""
+    try:
+        _obj, end = json.JSONDecoder().raw_decode(text, start)
+        return text[start:end].strip(), text[end:].strip()
+    except json.JSONDecodeError:
+        return text, ""
+
+
 def parse_response(response: str):
     """Split model output into (json_raw, csv_section, discovered_section).
-    Returns the raw JSON string — use _try_parse_json() to parse it."""
-    parts = response.split("CORRECTIONS_CSV", 1)
-    json_raw = _strip_fences(parts[0].strip())
-    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    Handles any combination of markers, markdown fences, and raw output.
+    Returns the raw JSON string — use _try_parse_json() to parse it.
+    """
+    # Step 1: if there's an explicit CORRECTIONS_CSV marker, split on it
+    if "CORRECTIONS_CSV" in response:
+        parts = response.split("CORRECTIONS_CSV", 1)
+        stripped = _strip_fences(parts[0].strip())
+        json_raw, json_tail = _split_json_from_rest(stripped)
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        merged = "\n".join(x for x in (json_tail, rest) if x)
+        csv_section = ""
+        discovered_section = ""
+        if merged:
+            parts2 = merged.split("DISCOVERED_ERRORS", 1)
+            csv_section = _strip_fences(parts2[0].strip())
+            discovered_section = parts2[1].strip() if len(parts2) > 1 else ""
+        return json_raw, csv_section, discovered_section
+
+    # Step 2: fenced blocks; split JSON from CSV with raw_decode (first fence
+    # may still contain JSON+CSV if the model used two ``` regions).
+    blocks = _FENCED_BLOCK_RE.findall(response)
+    if len(blocks) >= 2:
+        json_raw, rest0 = _split_json_from_rest(blocks[0].strip())
+        merged = "\n".join(x for x in (rest0, blocks[1].strip()) if x)
+        csv_section = ""
+        discovered_section = ""
+        if merged:
+            if "DISCOVERED_ERRORS" in merged:
+                p = merged.split("DISCOVERED_ERRORS", 1)
+                csv_section = _strip_fences(p[0].strip())
+                discovered_section = p[1].strip()
+            else:
+                csv_section = _strip_fences(merged)
+        if not discovered_section and "DISCOVERED_ERRORS" in response:
+            discovered_section = response.split("DISCOVERED_ERRORS", 1)[1].strip()
+        return json_raw, csv_section, discovered_section
+
+    # Single block or no blocks: extract content, then split JSON / CSV
+    if blocks:
+        content = blocks[0].strip()
+        last_fence_end = response.rfind("```")
+        if last_fence_end != -1:
+            trailing = response[last_fence_end + 3:].strip()
+            if trailing:
+                content = content + "\n" + trailing
+    else:
+        content = _strip_fences(response.strip())
+
+    json_raw, rest = _split_json_from_rest(content)
 
     csv_section = ""
     discovered_section = ""
     if rest:
-        parts2 = rest.split("DISCOVERED_ERRORS", 1)
-        csv_section = parts2[0].strip()
-        discovered_section = parts2[1].strip() if len(parts2) > 1 else ""
+        if "DISCOVERED_ERRORS" in rest:
+            parts = rest.split("DISCOVERED_ERRORS", 1)
+            csv_section = _strip_fences(parts[0].strip())
+            discovered_section = parts[1].strip()
+        else:
+            csv_section = _strip_fences(rest)
 
     return json_raw, csv_section, discovered_section
 
@@ -544,11 +628,14 @@ def main():
         Returns (json_raw, csv_section, response).
         """
         messages = _build_messages(payload)
+        input_est = _estimate_tokens("".join(m["content"] for m in messages))
         auto_max = _compute_max_tokens(model_id, messages)
         effective_max = min(max_tokens, auto_max) if max_tokens else auto_max
+        base_id = model_id.split(":")[0]
+        ctx = MODEL_CONTEXT_WINDOW.get(base_id, DEFAULT_CONTEXT_WINDOW)
         print(
-            f"    tokens: ~{_estimate_tokens(''.join(m['content'] for m in messages))} in, "
-            f"max_out={effective_max}",
+            f"    context_window={ctx}, ~{input_est} input tokens, "
+            f"max_output={effective_max}",
             file=sys.stderr,
         )
 
@@ -565,17 +652,32 @@ def main():
                 )
             raise
 
+        output_est = _estimate_tokens(response)
         json_raw, csv_section, _ = parse_response(response)
 
-        truncated = (finish_reason or "").lower() in ("length",)
-        if not truncated and json_raw:
+        fr_from_api = (finish_reason or "").lower()
+        truncated_by_length = fr_from_api == "length"
+        truncated_by_heuristic = False
+        if not truncated_by_length and json_raw:
             stripped = json_raw.rstrip()
             if stripped and stripped[-1] not in ("}", "]"):
-                truncated = True
+                truncated_by_heuristic = True
+
+        truncated = truncated_by_length or truncated_by_heuristic
+        has_csv = bool(csv_section.strip())
+        json_tail = json_raw.rstrip()[-80:] if json_raw else "(empty)"
+
+        print(
+            f"    finish_reason={finish_reason}, ~{output_est} output tokens, "
+            f"has_csv={has_csv}",
+            file=sys.stderr,
+        )
+        print(f"    json tail: ...{json_tail!r}", file=sys.stderr)
+
         if truncated:
+            reason = "finish_reason=length" if truncated_by_length else "heuristic (json doesn't end with } or ])"
             print(
-                f"  Response truncated (finish_reason={finish_reason}, "
-                f"max_tokens={effective_max}). Attempting JSON repair...",
+                f"  Truncation detected via {reason}. Attempting JSON repair...",
                 file=sys.stderr,
             )
 
