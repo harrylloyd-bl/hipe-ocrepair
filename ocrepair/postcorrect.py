@@ -204,98 +204,6 @@ def _safe_json_parse(text: str):
         return None
 
 
-def _repair_truncated_json(raw: str):
-    """Try to repair JSON truncated mid-stream by closing open brackets/braces.
-
-    Works for the common case where the model hit max_tokens and the response
-    was cut off inside a JSON array of objects — even if the cut happens
-    mid-string-value.  Returns the parsed object or None if not feasible.
-    """
-    s = raw.rstrip()
-    if not s:
-        return None
-
-    # Quick check: maybe valid JSON followed by trailing text
-    result = _safe_json_parse(s)
-    if result is not None:
-        return result
-
-    # Pass 1: parse to determine state at end of string
-    stack: list[str] = []
-    in_string = False
-    escape = False
-    for ch in s:
-        if escape:
-            escape = False
-            continue
-        if ch == "\\":
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch in ("{", "["):
-            stack.append(ch)
-        elif ch == "}":
-            if stack and stack[-1] == "{":
-                stack.pop()
-        elif ch == "]":
-            if stack and stack[-1] == "[":
-                stack.pop()
-
-    if not in_string and not stack:
-        return _safe_json_parse(s)
-
-    # Pass 2: build the suffix to close everything
-    closers = {"[": "]", "{": "}"}
-    suffix = ""
-    if in_string:
-        suffix += '"'
-    suffix += "".join(closers[opener] for opener in reversed(stack))
-
-    repaired = s + suffix
-    result = _safe_json_parse(repaired)
-    if result is not None:
-        return result
-
-    # Fallback: walk back to the last complete key-value pair, then close.
-    for cut in range(len(s) - 1, max(0, len(s) - 2000), -1):
-        candidate = s[:cut + 1].rstrip().rstrip(",")
-        st: list[str] = []
-        ins = False
-        esc = False
-        for ch in candidate:
-            if esc:
-                esc = False
-                continue
-            if ch == "\\":
-                esc = True
-                continue
-            if ch == '"':
-                ins = not ins
-                continue
-            if ins:
-                continue
-            if ch in ("{", "["):
-                st.append(ch)
-            elif ch == "}":
-                if st and st[-1] == "{":
-                    st.pop()
-            elif ch == "]":
-                if st and st[-1] == "[":
-                    st.pop()
-        if ins:
-            continue
-        fix = candidate + "".join(closers[o] for o in reversed(st))
-        result = _safe_json_parse(fix)
-        if result is not None:
-            return result
-
-    return None
-
-
 def _try_parse_json(raw: str):
     """Parse JSON, handling cases where the model returns multiple objects
     instead of a proper array (Extra data error), and attempting repair
@@ -305,17 +213,6 @@ def _try_parse_json(raw: str):
         return json.loads(raw)
     except json.JSONDecodeError as first_err:
         print(f"  (initial json.loads failed: {first_err})", file=sys.stderr)
-
-    # Attempt repair (truncated / trailing-data output)
-    result = _repair_truncated_json(raw)
-    if result is not None:
-        n = len(result) if isinstance(result, list) else 1
-        print(f"  (repaired truncated JSON — recovered {n} record(s))",
-              file=sys.stderr)
-        return result
-    elif raw.strip():
-        print(f"  (JSON repair could not fix output, "
-              f"raw ends with: ...{raw[-80:]!r})", file=sys.stderr)
 
     # Model may have returned one JSON object per line instead of an array
     objects = []
@@ -327,9 +224,11 @@ def _try_parse_json(raw: str):
             objects.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+
     if objects:
         return objects
-    raise json.JSONDecodeError("Could not parse model JSON output", raw, 0)
+    else:
+        raise json.JSONDecodeError("Could not parse model JSON output", raw, 0)
 
 
 _FENCED_BLOCK_RE = re.compile(
