@@ -1,1 +1,1 @@
-from ocrepair import config  # noqa: F401
+from ocrepair import ocr_postcorrect_hf  # noqa: F401
