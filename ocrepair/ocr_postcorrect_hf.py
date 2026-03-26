@@ -16,19 +16,28 @@ Usage:
 """
 
 import argparse
+from datetime import datetime
 import getpass
 import json
+import logging
 import os
 import sys
 import time
 
+from huggingface_hub import InferenceClient
+
 try:
-    from dotenv import load_dotenv  # ty:ignore[unresolved-import]
+    from dotenv import load_dotenv
     if "HF_TOKEN" not in os.environ:
         load_dotenv()
 except ImportError:
     pass
 
+if not os.path.exists("logs"):
+    os.makedirs("logs")
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(filename=f"logs/{datetime.now().strftime("%Y%m%d_%H%M")}.log", encoding="utf8", level=logging.DEBUG)
 
 # Lookup table mapping friendly short names to full Hugging Face model IDs.
 # This lets you type e.g. --model mistral3 instead of the full path.
@@ -104,10 +113,8 @@ custom_label|count|example|description
 API_TIMEOUT = 600  # seconds per request before giving up
 
 
-def get_client():
+def get_client() -> InferenceClient:
     """Create and return a Hugging Face InferenceClient, authenticated with HF_TOKEN."""
-    from huggingface_hub import InferenceClient  # ty:ignore[unresolved-import]
-
     token = os.environ.get("HF_TOKEN")
     if not token:
         token = getpass.getpass(
@@ -553,6 +560,7 @@ def main():
         )
 
         try:
+            logging.info(messages)
             response, finish_reason = chat_completion(
                 client, model_id, messages,
                 max_tokens=effective_max, temperature=temperature,
