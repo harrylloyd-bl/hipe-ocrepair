@@ -214,11 +214,6 @@ def _try_parse_json(raw: str):
         raise json.JSONDecodeError("Could not parse model JSON output", raw, 0)
 
 
-_FENCED_BLOCK_RE = re.compile(
-    r"```[a-zA-Z]*\s*\n(.*?)```", re.DOTALL
-)
-
-
 def _json_value_start(text: str) -> int | None:
     """Index of the first ``[`` or ``{`` that can start a JSON value."""
     for i, ch in enumerate(text):
@@ -246,6 +241,11 @@ def _split_json_from_rest(text: str) -> tuple[str, str]:
         return text[start:end].strip(), text[end:].strip()
     except json.JSONDecodeError:
         return text, ""
+
+
+_FENCED_BLOCK_RE = re.compile(
+    r"```[a-zA-Z]*\s*\n(.*?)```", re.DOTALL
+)
 
 
 def parse_response(response: str):
