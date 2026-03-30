@@ -104,11 +104,7 @@ Columns: document_id,ocr_hypothesis_snippet,ocr_postcorrection_snippet,error_typ
 - confidence: high, medium, or low
 - One row per document_id (use no_change if unchanged)
 - Do not wrap the CSV in markdown fences
-
-After the CSV:
-DISCOVERED_ERRORS
-custom_label|count|example|description
-(or "none" if no custom types)"""
+"""
 
 
 API_TIMEOUT = 600  # seconds per request before giving up
@@ -191,21 +187,6 @@ def _strip_fences(text: str) -> str:
     return s
 
 
-# TODO unused fn and decoder, consider removing
-_json_decoder = json.JSONDecoder()
-
-def _safe_json_parse(text: str):
-    """Parse the first complete JSON value from *text*, ignoring trailing data."""
-    text = text.lstrip()
-    if not text:
-        return None
-    try:
-        obj, _ = _json_decoder.raw_decode(text)
-        return obj
-    except json.JSONDecodeError:
-        return None
-
-
 def _try_parse_json(raw: str):
     """Parse JSON, handling cases where the model returns multiple objects
     instead of a proper array (Extra data error), and attempting repair
@@ -268,7 +249,7 @@ def _split_json_from_rest(text: str) -> tuple[str, str]:
 
 
 def parse_response(response: str):
-    """Split model output into (json_raw, csv_section, discovered_section).
+    """Split model output into (json_raw, csv_section).
 
     Handles any combination of markers, markdown fences, and raw output.
     Returns the raw JSON string — use _try_parse_json() to parse it.
@@ -280,13 +261,10 @@ def parse_response(response: str):
         json_raw, json_tail = _split_json_from_rest(stripped)
         rest = parts[1].strip() if len(parts) > 1 else ""
         merged = "\n".join(x for x in (json_tail, rest) if x)
-        csv_section = ""
-        discovered_section = ""
         if merged:
-            parts2 = merged.split("DISCOVERED_ERRORS", 1)
-            csv_section = _strip_fences(parts2[0].strip())
-            discovered_section = parts2[1].strip() if len(parts2) > 1 else ""
-        return json_raw, csv_section, discovered_section
+            csv_section = _strip_fences(merged.strip())
+
+        return json_raw, csv_section
 
     # Step 2: fenced blocks; split JSON from CSV with raw_decode (first fence
     # may still contain JSON+CSV if the model used two ``` regions).
@@ -295,17 +273,10 @@ def parse_response(response: str):
         json_raw, rest0 = _split_json_from_rest(blocks[0].strip())
         merged = "\n".join(x for x in (rest0, blocks[1].strip()) if x)
         csv_section = ""
-        discovered_section = ""
         if merged:
-            if "DISCOVERED_ERRORS" in merged:
-                p = merged.split("DISCOVERED_ERRORS", 1)
-                csv_section = _strip_fences(p[0].strip())
-                discovered_section = p[1].strip()
-            else:
-                csv_section = _strip_fences(merged)
-        if not discovered_section and "DISCOVERED_ERRORS" in response:
-            discovered_section = response.split("DISCOVERED_ERRORS", 1)[1].strip()
-        return json_raw, csv_section, discovered_section
+            csv_section = _strip_fences(merged)
+
+        return json_raw, csv_section
 
     # Single block or no blocks: extract content, then split JSON / CSV
     if blocks:
@@ -321,16 +292,10 @@ def parse_response(response: str):
     json_raw, rest = _split_json_from_rest(content)
 
     csv_section = ""
-    discovered_section = ""
     if rest:
-        if "DISCOVERED_ERRORS" in rest:
-            parts = rest.split("DISCOVERED_ERRORS", 1)
-            csv_section = _strip_fences(parts[0].strip())
-            discovered_section = parts[1].strip()
-        else:
-            csv_section = _strip_fences(rest)
+        csv_section = _strip_fences(rest)
 
-    return json_raw, csv_section, discovered_section
+    return json_raw, csv_section
 
 
 def _csv_body_lines(csv_section: str) -> tuple[str | None, list[str]]:
