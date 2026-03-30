@@ -172,6 +172,7 @@ def resolve_model(name_or_id: str) -> str:
     If the input doesn't match any short name, return it unchanged
     (so you can also pass a full model ID directly).
     """
+    # TODO warn if ID not in MODEL_REGISTRY keys or values
     key = name_or_id.strip().lower()            # normalise to lowercase for lookup
     return MODEL_REGISTRY.get(key, name_or_id.strip())  # fallback to original if not found
 
@@ -179,18 +180,19 @@ def resolve_model(name_or_id: str) -> str:
 def _strip_fences(text: str) -> str:
     """Remove markdown code fences (```json ... ```) if present."""
     s = text.strip()
-    if s.startswith("```"):
-        lines = s.split("\n")
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        s = "\n".join(lines).strip()
+    if s.startswith("```json"):
+        s = s.lstrip("```json")
+    if s.endswith("```"):
+        s = s.rstrip("```")
+
+    # Remove any residual leading/trailing linebreaks
+    s = s.strip("\n")
+
     return s
 
 
+# TODO unused fn and decoder, consider removing
 _json_decoder = json.JSONDecoder()
-
 
 def _safe_json_parse(text: str):
     """Parse the first complete JSON value from *text*, ignoring trailing data."""
@@ -248,7 +250,7 @@ def _split_json_from_rest(text: str) -> tuple[str, str]:
     """Split *text* into the first complete JSON value and the remainder.
 
     Uses :meth:`json.JSONDecoder.raw_decode` so delimiters follow JSON
-    string/escape rules (unlike naive bracket counting).  If parsing fails,
+    string/escape rules (unlike naive bracket counting).
     If parsing fails, returns *text* unchanged and an empty rest string so
     callers can fall back to repair heuristics.
     """
