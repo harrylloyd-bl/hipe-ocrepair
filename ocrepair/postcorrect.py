@@ -25,6 +25,8 @@ import re
 import sys
 import time
 
+type Record = dict[str, dict[str,str | int]]
+
 from huggingface_hub import InferenceClient
 
 try:
@@ -333,7 +335,7 @@ def _load_input(path: str, jsonl: bool):
         return json.load(f)
 
 
-def _slim_extract(records: list[dict[str, dict[str,str]]]):
+def _slim_extract(records: list[Record]):
     """Extract lightweight payload: only document_id + language + ocr_hypothesis text."""
     slim_records = []
     for rec in records:
@@ -349,7 +351,7 @@ def _slim_extract(records: list[dict[str, dict[str,str]]]):
     return slim_records
 
 
-def _slim_reinject(original_records: list[dict[str, dict[str,str]]], corrections: list[dict[str, dict[str,str]]]):
+def _slim_reinject(original_records: list[Record], corrections: list[Record]):
     """Merge model corrections back into original records by document_id order."""
     correction_map = {}
     for corr in corrections:
@@ -377,7 +379,7 @@ def _slim_reinject(original_records: list[dict[str, dict[str,str]]], corrections
     return merged
 
 
-def _build_messages(system_prompt: str, payload: list[dict[str, dict[str,str]]]|str):
+def _build_messages(system_prompt: str, payload: list[Record]|str):
     user_content = json.dumps(payload, ensure_ascii=False, indent=0)
     return [
         {"role": "system", "content": system_prompt},
@@ -385,7 +387,7 @@ def _build_messages(system_prompt: str, payload: list[dict[str, dict[str,str]]]|
     ]
 
 def _run_model(client: InferenceClient, model_id: str,
-               system_prompt: str, payload: list[dict[str, dict[str,str]]],
+               system_prompt: str, payload: list[Record],
                max_tokens: int, temperature: float):
     """Single API call. Automatically computes max_tokens from the model's
     context window and the actual input size.

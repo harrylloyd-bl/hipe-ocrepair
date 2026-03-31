@@ -3,6 +3,7 @@ import ocrepair.postcorrect as pc
 import pytest
 from huggingface_hub import InferenceClient
 
+type Record = dict[str, dict[str,str | int]]
 
 def test_create_client_with_token():
     client = pc.get_client()
@@ -165,50 +166,37 @@ def test__csv_body_lines():
     lines = "\n".join(["l0", "", "l1", "l2"])
     assert pc._csv_body_lines(lines) == ("l0", ["l1", "l2"])
 
-{
-    "document_metadata": {
-        "document_id": "BHFA-1872-04-20-a-p0002_par26",
-        "primary_dataset_name": "impresso-snippets",
-        "primary_dataset_filename": "v2025-12-04/BL/BHFA/pages/BHFA-1872/BHFA-1872-04-20-a-pages.jsonl.bz2",
-        "primary_dataset_doi": "",
-        "primary_dataset_version": "1.0",
-        "primary_dataset_license": "CC-BY-NC-SA 4.0",
-        "benchmark_dataset_name": "hipe-ocrepair-bench-impresso-snippets",
-        "benchmark_dataset_split": "dev",
-        "document_type": "newspaper",
-        "date": "1872-04-20",
-        "language": "en", 
-        "publication_title": "BHFA-1872-04-20-a-p0002", 
-        "transcription_unit_scope": "paragraph"
-    },
-    "ocr_hypothesis": {
-        "transcription_unit": "I AMES WADDINGtON, law of the \"Sun\nHotel,\" Barrow-in-Furness, hereby gives\nnotice that, owing to have given up the above\nbusiness, he will be glad if persons owing him\naccounts, will forward amounts of the same to.\nmh:ress given below, and he her, by gives further\nnotice to those whom he may le, owing an account\nto forward the same for payment —Address, James\nWaddington, sem. care of Mr. Joseph Waddington\nNewbarns, near Barrow-in-Furnes,.",
-        "num_tokens": 74,
-        "num_chars": 442,
-        "line_offsets": [[0, 34], [35, 74], [75, 120], [121, 167], [168, 214], [215, 264], [265, 313], [314, 361], [362, 408], [409, 442]],
-        "paragraph_offsets": [[0, 442]],
-        "quality_report": {
-            "cer": 0.043084,
-            "wer": 0.2222222222222222,
-            "nb_char_substitutions": 12,
-            "nb_char_deletions": 3,
-            "nb_char_insertions": 4,
-            "nb_char_errors": 19
-        }
-    },
-    "ground_truth": {
-        "transcription_unit": "JAMES WADDINGTON, late of the \" Sun\nHotel,\" Barrow-in-Furness, hereby gives\nnotice that, owing to have given up the above\nbusiness, he will be glad if persons owing him\naccounts, will forward amounts of the same to\naddress given below, and he hereby gives further\nnotice to those whom he may be owing an account\nto forward the same for payment.-Address, James\nWaddington, sen., care of Mr. Joseph Waddington\nNewbarns, near Barrow-in-Furness.",
-        "num_tokens": 72,
-        "num_chars": 441,
-        "line_offsets": [[0, 35], [36, 75], [76, 121], [122, 168], [169, 214], [215, 263], [264, 311], [312, 359], [360, 407], [408, 441]],
-        "paragraph_offsets": [[0, 441]],
-        "quality_report": {}
-    }
-}
-
 
 def test__slim_extract():
-    pass
+    with pytest.raises(IndexError):
+        pc._slim_extract(None)  # ty:ignore[invalid-argument-type]
+
+    test_record: list[Record] = [{
+        "document_metadata": {
+            "document_id": "BHFA-1872-04-20-a-p0002_par26",
+            "primary_dataset_name": "impresso-snippets",
+            "language": "en"
+        },
+        "ocr_hypothesis": {
+            "transcription_unit": "I AMES WADDINGtON, law of the \"Sun\nHotel,\" Barrow-in-Furness, hereby gives\nnotice that, owing to have given up the above\nbusiness, he will be glad if persons owing him\naccounts, will forward amounts of the same to.\nmh:ress given below, and he her, by gives further\nnotice to those whom he may le, owing an account\nto forward the same for payment —Address, James\nWaddington, sem. care of Mr. Joseph Waddington\nNewbarns, near Barrow-in-Furnes,.",
+            "num_tokens": 74
+        },
+        "ground_truth": {
+            "num_tokens": 72
+        }
+    }]
+
+    expected_output: list[Record] = [{
+        "document_metadata": {
+            "document_id": "BHFA-1872-04-20-a-p0002_par26",
+            "language": "en"
+        },
+        "ocr_hypothesis": {
+            "transcription_unit": "I AMES WADDINGtON, law of the \"Sun\nHotel,\" Barrow-in-Furness, hereby gives\nnotice that, owing to have given up the above\nbusiness, he will be glad if persons owing him\naccounts, will forward amounts of the same to.\nmh:ress given below, and he her, by gives further\nnotice to those whom he may le, owing an account\nto forward the same for payment —Address, James\nWaddington, sem. care of Mr. Joseph Waddington\nNewbarns, near Barrow-in-Furnes,.",
+        }
+    }]
+
+    assert pc._slim_extract(records=test_record) == expected_output
 
 
 @pytest.mark.paid()
@@ -219,10 +207,7 @@ def test__run_model():
     payload = 'Please respond with the phrase `{"key0": "value0"} csv section` if functioning'
     temperature = 0.2
     messages = pc._build_messages(system_prompt, payload)
-    # content, finish_reason = pc.chat_completion(client=client, model=model_id, messages=messages)
-    # assert content == '{"key0": "value0"} csv section\n'
 
-    breakpoint()
     json_raw, csv_section, response = pc._run_model(
         client=client,
         model_id=model_id,
