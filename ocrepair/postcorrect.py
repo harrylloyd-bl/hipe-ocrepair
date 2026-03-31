@@ -50,14 +50,24 @@ MODEL_REGISTRY = {
     "deepseek-v3.2": "deepseek-ai/DeepSeek-V3.2",
 }
 
-MODEL_CONTEXT_WINDOW: dict[str, int] = {
-    "google/gemma-3-27b-it": 32_768,
-    "mistralai/Mistral-Small-3.1-24B-Instruct-2503": 131_072,
-    "Qwen/Qwen3.5-397B-A17B": 131_072,
-    "Qwen/Qwen3-235B-A22B-Thinking-2507": 131_072,
-    "deepseek-ai/DeepSeek-V3.2": 131_072,
+MODEL_CONTEXT_WINDOW: dict[str, dict[str, int]] = {
+    "input":{
+        "google/gemma-3-27b-it": 32768,
+        "mistralai/Mistral-Small-3.1-24B-Instruct-2503": 131072,
+        "Qwen/Qwen3.5-397B-A17B": 262144,
+        "Qwen/Qwen3-235B-A22B-Thinking-2507": 262144,
+        "deepseek-ai/DeepSeek-V3.2": 131072,
+    },
+    "output":{
+        "google/gemma-3-27b-it": 8192 ,
+        "mistralai/Mistral-Small-3.1-24B-Instruct-2503": 131072,
+        "Qwen/Qwen3.5-397B-A17B": 262144,
+        "Qwen/Qwen3-235B-A22B-Thinking-2507": 262144,
+        "deepseek-ai/DeepSeek-V3.2": 131072,
+    }
 }
-DEFAULT_CONTEXT_WINDOW = 32_768
+
+DEFAULT_CONTEXT_WINDOW = 32768
 CONTEXT_SAFETY_MARGIN = 256  # tokens reserved for framing overhead
 
 def _estimate_tokens(text: str) -> int:
@@ -68,7 +78,7 @@ def _estimate_tokens(text: str) -> int:
 def _compute_max_tokens(model_id: str, messages: list[dict]) -> int:
     """Calculate the maximum output tokens available for a given model and input."""
     base_id = model_id.split(":")[0]
-    ctx = MODEL_CONTEXT_WINDOW.get(base_id, DEFAULT_CONTEXT_WINDOW)
+    ctx = MODEL_CONTEXT_WINDOW["output"].get(base_id, DEFAULT_CONTEXT_WINDOW)
     input_text = "".join(m.get("content", "") for m in messages)
     input_tokens = _estimate_tokens(input_text)
     available = ctx - input_tokens - CONTEXT_SAFETY_MARGIN
@@ -367,24 +377,27 @@ def _slim_reinject(original_records: list[dict[str, dict[str,str]]], corrections
     return merged
 
 
-def _build_messages(payload: list[dict[str, dict[str,str]]]):
+def _build_messages(system_prompt: str, payload: list[dict[str, dict[str,str]]]|str):
     user_content = json.dumps(payload, ensure_ascii=False, indent=0)
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content},
     ]
 
-def _run_model(client: InferenceClient, model_id: str, payload: list[dict[str, dict[str,str]]], max_tokens: int, temperature: float):
+def _run_model(client: InferenceClient, model_id: str,
+               system_prompt: str, payload: list[dict[str, dict[str,str]]],
+               max_tokens: int, temperature: float):
     """Single API call. Automatically computes max_tokens from the model's
     context window and the actual input size.
     Returns (json_raw, csv_section, response).
     """
-    messages = _build_messages(payload)
+    messages = _build_messages(system_prompt=system_prompt, payload=payload)
     input_est = _estimate_tokens("".join(m["content"] for m in messages))
     auto_max = _compute_max_tokens(model_id, messages)
     effective_max = min(max_tokens, auto_max) if max_tokens else auto_max
+    breakpoint()
     base_id = model_id.split(":")[0]
-    ctx = MODEL_CONTEXT_WINDOW.get(base_id, DEFAULT_CONTEXT_WINDOW)
+    ctx = MODEL_CONTEXT_WINDOW["input"].get(base_id, DEFAULT_CONTEXT_WINDOW)
     print(
         f"    context_window={ctx}, ~{input_est} input tokens, "
         f"max_output={effective_max}",
@@ -394,8 +407,9 @@ def _run_model(client: InferenceClient, model_id: str, payload: list[dict[str, d
     try:
         logging.info(messages)
         response, finish_reason = chat_completion(
-            client, model_id, messages,
-            max_tokens=effective_max, temperature=temperature,
+            client=client, model=model_id, messages=messages,
+            temperature=temperature,
+            max_tokens=effective_max
         )
     except Exception as e:
         if "maximum context length" in str(e) or "bad_request" in str(e).lower():
@@ -406,8 +420,9 @@ def _run_model(client: InferenceClient, model_id: str, payload: list[dict[str, d
         raise
 
     output_est = _estimate_tokens(response)
-    json_raw, csv_section, _ = parse_response(response)
-
+    
+    json_raw, csv_section = parse_response(response)
+    
     fr_from_api = (finish_reason or "").lower()
     truncated_by_length = fr_from_api == "length"
     truncated_by_heuristic = False
@@ -430,7 +445,7 @@ def _run_model(client: InferenceClient, model_id: str, payload: list[dict[str, d
     if truncated:
         reason = "finish_reason=length" if truncated_by_length else "heuristic (json doesn't end with } or ])"
         print(
-            f"  Truncation detected via {reason}. Attempting JSON repair...",
+            f"  Truncation detected via {reason}.",
             file=sys.stderr,
         )
 
@@ -517,7 +532,7 @@ def _run_batched(client, model_id, records, max_tokens, temperature, batch_size:
             last_response = ""
             try:
                 json_raw, csv_section, last_response = _run_model(
-                    client, model_id, slim_batch, max_tokens, temperature,
+                    client, model_id, SYSTEM_PROMPT, slim_batch, max_tokens, temperature,
                 )
                 raw_responses.append(last_response)
 
@@ -731,7 +746,7 @@ def main():
                     )
                 else:
                     json_raw, csv_section, _ = _run_model(
-                        client, mid, payload, args.max_tokens, args.temperature,
+                        client, mid, SYSTEM_PROMPT, payload, args.max_tokens, args.temperature,
                     )
                     _write_json(json_path, _try_parse_json(json_raw), is_jsonl=False)
                     with open(csv_path, "w", encoding="utf-8", newline="") as f:
@@ -787,7 +802,7 @@ def main():
                 print("Raw output written to", args.output_raw.name, file=sys.stderr)
         else:
             json_raw, csv_section, response = _run_model(
-                client, model_id, payload, args.max_tokens, args.temperature,
+                client, model_id, SYSTEM_PROMPT, payload, args.max_tokens, args.temperature,
             )
             if args.output_raw:
                 args.output_raw.write(response)
