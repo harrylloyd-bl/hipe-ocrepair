@@ -38,7 +38,7 @@ if not os.path.exists("logs"):
     os.makedirs("logs")
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename=f"logs/{datetime.now().strftime("%Y%m%d_%H%M")}.log", encoding="utf8", level=logging.DEBUG)
+logging.basicConfig(filename=f"logs/{datetime.now().strftime('%Y%m%d_%H%M')}.log", encoding="utf8", level=logging.DEBUG)
 
 # Lookup table mapping friendly short names to full Hugging Face model IDs.
 # This lets you type e.g. --model mistral3 instead of the full path.
@@ -306,6 +306,277 @@ def _csv_body_lines(csv_section: str) -> tuple[str | None, list[str]]:
     return lines[0], lines[1:]
 
 
+def _load_input(path: str, jsonl: bool):
+    """Load input. JSONL → list of dicts; JSON → single object/array."""
+    with open(path, encoding="utf-8") as f:
+        if jsonl:
+            records = []
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"Skip line {line_no}: invalid JSON: {e}", file=sys.stderr)
+            return records
+        return json.load(f)
+
+
+def _slim_extract(records: list[dict[str, dict[str,str]]]):
+    """Extract lightweight payload: only document_id + language + ocr_hypothesis text."""
+    slim_records = []
+    for rec in records:
+        doc_id = rec.get("document_metadata", {}).get("document_id", "unknown")
+        lang = rec.get("document_metadata", {}).get("language", "en")
+        hyp = rec.get("ocr_hypothesis", {})
+        hyp_text = hyp.get("transcription_unit", "") if isinstance(hyp, dict) else str(hyp)
+        slim_records.append({
+            "document_id": doc_id,
+            "language": lang,
+            "ocr_hypothesis": hyp_text,
+        })
+    return slim_records
+
+
+def _slim_reinject(original_records: list[dict[str, dict[str,str]]], corrections: list[dict[str, dict[str,str]]]):
+    """Merge model corrections back into original records by document_id order."""
+    correction_map = {}
+    for corr in corrections:
+        doc_id = corr.get("document_id")
+        text = corr.get("ocr_postcorrection_output", "")
+        if doc_id:
+            correction_map[doc_id] = text
+
+    merged = []
+    for rec in original_records:
+        rec = json.loads(json.dumps(rec))  # deep copy
+        doc_id = rec.get("document_metadata", {}).get("document_id")
+        corrected_text = correction_map.get(doc_id)
+        if corrected_text is None and corrections:
+            idx = len(merged)
+            if idx < len(corrections):
+                corrected_text = corrections[idx].get("ocr_postcorrection_output", "")
+
+        if corrected_text is not None:
+            if isinstance(rec.get("ocr_postcorrection_output"), dict):
+                rec["ocr_postcorrection_output"]["transcription_unit"] = corrected_text
+            else:
+                rec["ocr_postcorrection_output"] = corrected_text
+        merged.append(rec)
+    return merged
+
+
+def _build_messages(payload: list[dict[str, dict[str,str]]]):
+    user_content = json.dumps(payload, ensure_ascii=False, indent=0)
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+def _run_model(client: InferenceClient, model_id: str, payload: list[dict[str, dict[str,str]]], max_tokens: int, temperature: float):
+    """Single API call. Automatically computes max_tokens from the model's
+    context window and the actual input size.
+    Returns (json_raw, csv_section, response).
+    """
+    messages = _build_messages(payload)
+    input_est = _estimate_tokens("".join(m["content"] for m in messages))
+    auto_max = _compute_max_tokens(model_id, messages)
+    effective_max = min(max_tokens, auto_max) if max_tokens else auto_max
+    base_id = model_id.split(":")[0]
+    ctx = MODEL_CONTEXT_WINDOW.get(base_id, DEFAULT_CONTEXT_WINDOW)
+    print(
+        f"    context_window={ctx}, ~{input_est} input tokens, "
+        f"max_output={effective_max}",
+        file=sys.stderr,
+    )
+
+    try:
+        logging.info(messages)
+        response, finish_reason = chat_completion(
+            client, model_id, messages,
+            max_tokens=effective_max, temperature=temperature,
+        )
+    except Exception as e:
+        if "maximum context length" in str(e) or "bad_request" in str(e).lower():
+            print(
+                f"  Context window exceeded at max_tokens={effective_max}.",
+                file=sys.stderr,
+            )
+        raise
+
+    output_est = _estimate_tokens(response)
+    json_raw, csv_section, _ = parse_response(response)
+
+    fr_from_api = (finish_reason or "").lower()
+    truncated_by_length = fr_from_api == "length"
+    truncated_by_heuristic = False
+    if not truncated_by_length and json_raw:
+        stripped = json_raw.rstrip()
+        if stripped and stripped[-1] not in ("}", "]"):
+            truncated_by_heuristic = True
+
+    truncated = truncated_by_length or truncated_by_heuristic
+    has_csv = bool(csv_section.strip())
+    json_tail = json_raw.rstrip()[-80:] if json_raw else "(empty)"
+
+    print(
+        f"    finish_reason={finish_reason}, ~{output_est} output tokens, "
+        f"has_csv={has_csv}",
+        file=sys.stderr,
+    )
+    print(f"    json tail: ...{json_tail!r}", file=sys.stderr)
+
+    if truncated:
+        reason = "finish_reason=length" if truncated_by_length else "heuristic (json doesn't end with } or ])"
+        print(
+            f"  Truncation detected via {reason}. Attempting JSON repair...",
+            file=sys.stderr,
+        )
+
+    return json_raw, csv_section, response
+
+
+def _make_batches(records, size):
+    """Split a list into batches. size=0 means one batch with everything."""
+    if size <= 0:
+        return [records]
+    return [records[i:i + size] for i in range(0, len(records), size)]
+
+
+def _run_batched(client, model_id, records, max_tokens, temperature, batch_size: int, 
+                label="", only_batches=None,
+                output_json=None, output_csv=None, is_jsonl=True):
+    """Run model on batches of slim payloads; re-inject corrections into
+    the original records. Returns (all_results, merged_csv, raw_responses).
+
+    Output is written **incrementally** after each batch so that progress
+    is saved even if the process is killed mid-run.
+
+    If *only_batches* is a set of 1-indexed batch numbers, only those
+    batches are sent to the API; the rest are skipped (their records pass
+    through uncorrected).
+    """
+    send_records = _slim_extract(records)
+    slim_batches = _make_batches(send_records, batch_size)
+    orig_batches = _make_batches(records, batch_size)
+    n_calls = len(slim_batches)
+    if only_batches:
+        run_count = sum(1 for i in range(1, n_calls + 1) if i in only_batches)
+        print(
+            f"  {label}{len(records)} records in {n_calls} batch(es) "
+            f"(batch_size={batch_size or 'all'}), running {run_count} selected batch(es): "
+            f"{sorted(only_batches)}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"  {label}{len(records)} records in {n_calls} batch(es) "
+            f"(batch_size={batch_size or 'all'})",
+            file=sys.stderr,
+        )
+
+    all_corrections = []
+    csv_header = None
+    csv_data_lines = []
+    raw_responses = []
+
+    json_fh = open(output_json, "w", encoding="utf-8") if output_json else None
+    csv_fh = open(output_csv, "w", encoding="utf-8", newline="") if output_csv else None
+
+    def _flush_json_batch(recs):
+        if not json_fh:
+            return
+        for rec in recs:
+            json_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        json_fh.flush()
+
+    def _flush_csv_rows(header, rows):
+        if not csv_fh:
+            return
+        if header and csv_fh.tell() == 0:
+            csv_fh.write(header + "\n")
+        for row in rows:
+            csv_fh.write(row + "\n")
+        csv_fh.flush()
+
+    failed = 0
+    try:
+        for batch_idx, (slim_batch, orig_batch) in enumerate(
+            zip(slim_batches, orig_batches), 1
+        ):
+            if only_batches and batch_idx not in only_batches:
+                _flush_json_batch(orig_batch)
+                continue
+            if batch_idx > 1:
+                time.sleep(3)
+            print(
+                f"  Batch {batch_idx}/{n_calls} ({len(slim_batch)} records)...",
+                file=sys.stderr,
+            )
+            last_response = ""
+            try:
+                json_raw, csv_section, last_response = _run_model(
+                    client, model_id, slim_batch, max_tokens, temperature,
+                )
+                raw_responses.append(last_response)
+
+                result = _try_parse_json(json_raw)
+                batch_corrections = result if isinstance(result, list) else [result]
+                all_corrections.extend(batch_corrections)
+
+                corrected = _slim_reinject(orig_batch, batch_corrections)
+                _flush_json_batch(corrected)
+
+                hdr, rows = _csv_body_lines(csv_section)
+                if hdr and csv_header is None:
+                    csv_header = hdr
+                csv_data_lines.extend(rows)
+                _flush_csv_rows(hdr, rows)
+
+            except Exception as e:
+                failed += 1
+                print(
+                    f"  Batch {batch_idx} failed (skipping): {e}",
+                    file=sys.stderr,
+                )
+                if last_response:
+                    preview = last_response[:300].replace("\n", "\\n")
+                    print(f"    Raw response preview: {preview}", file=sys.stderr)
+                _flush_json_batch(orig_batch)
+    finally:
+        if json_fh:
+            json_fh.close()
+            print(f"  Output saved to {output_json}", file=sys.stderr)
+        if csv_fh:
+            csv_fh.close()
+            if output_csv:
+                print(f"  Output saved to {output_csv}", file=sys.stderr)
+
+    if failed:
+        print(
+            f"  {failed}/{n_calls} batch(es) failed",
+            file=sys.stderr,
+        )
+
+    merged_csv = ""
+    if csv_header:
+        merged_csv = csv_header + "\n" + "\n".join(csv_data_lines)
+        if not merged_csv.endswith("\n"):
+            merged_csv += "\n"
+
+    all_results = _slim_reinject(records, all_corrections)
+    return all_results, merged_csv, raw_responses
+
+def _write_json(path, result, is_jsonl):
+    with open(path, "w", encoding="utf-8") as f:
+        if is_jsonl and isinstance(result, list):
+            for obj in result:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        else:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+
+
 def main():
     # ── Argument parser ──────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
@@ -428,273 +699,6 @@ def main():
     if args.batches:
         only_batches = set(int(b.strip()) for b in args.batches.split(",") if b.strip())
 
-    # ── helpers ──────────────────────────────────────────────────────────
-
-    def _load_input(path: str, jsonl: bool):
-        """Load input. JSONL → list of dicts; JSON → single object/array."""
-        with open(path, encoding="utf-8") as f:
-            if jsonl:
-                records = []
-                for line_no, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError as e:
-                        print(f"Skip line {line_no}: invalid JSON: {e}", file=sys.stderr)
-                return records
-            return json.load(f)
-
-    def _slim_extract(records):
-        """Extract lightweight payload: only document_id + language + ocr_hypothesis text."""
-        slim_records = []
-        for rec in records:
-            doc_id = rec.get("document_metadata", {}).get("document_id", "unknown")
-            lang = rec.get("document_metadata", {}).get("language", "en")
-            hyp = rec.get("ocr_hypothesis", {})
-            hyp_text = hyp.get("transcription_unit", "") if isinstance(hyp, dict) else str(hyp)
-            slim_records.append({
-                "document_id": doc_id,
-                "language": lang,
-                "ocr_hypothesis": hyp_text,
-            })
-        return slim_records
-
-    def _slim_reinject(original_records, corrections):
-        """Merge model corrections back into original records by document_id order."""
-        correction_map = {}
-        for corr in corrections:
-            doc_id = corr.get("document_id")
-            text = corr.get("ocr_postcorrection_output", "")
-            if doc_id:
-                correction_map[doc_id] = text
-
-        merged = []
-        for rec in original_records:
-            rec = json.loads(json.dumps(rec))  # deep copy
-            doc_id = rec.get("document_metadata", {}).get("document_id")
-            corrected_text = correction_map.get(doc_id)
-            if corrected_text is None and corrections:
-                idx = len(merged)
-                if idx < len(corrections):
-                    corrected_text = corrections[idx].get("ocr_postcorrection_output", "")
-
-            if corrected_text is not None:
-                if isinstance(rec.get("ocr_postcorrection_output"), dict):
-                    rec["ocr_postcorrection_output"]["transcription_unit"] = corrected_text
-                else:
-                    rec["ocr_postcorrection_output"] = corrected_text
-            merged.append(rec)
-        return merged
-
-    def _build_messages(payload):
-        user_content = json.dumps(payload, ensure_ascii=False, indent=0)
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
-
-    def _run_model(client, model_id, payload, max_tokens, temperature):
-        """Single API call. Automatically computes max_tokens from the model's
-        context window and the actual input size.
-        Returns (json_raw, csv_section, response).
-        """
-        messages = _build_messages(payload)
-        input_est = _estimate_tokens("".join(m["content"] for m in messages))
-        auto_max = _compute_max_tokens(model_id, messages)
-        effective_max = min(max_tokens, auto_max) if max_tokens else auto_max
-        base_id = model_id.split(":")[0]
-        ctx = MODEL_CONTEXT_WINDOW.get(base_id, DEFAULT_CONTEXT_WINDOW)
-        print(
-            f"    context_window={ctx}, ~{input_est} input tokens, "
-            f"max_output={effective_max}",
-            file=sys.stderr,
-        )
-
-        try:
-            logging.info(messages)
-            response, finish_reason = chat_completion(
-                client, model_id, messages,
-                max_tokens=effective_max, temperature=temperature,
-            )
-        except Exception as e:
-            if "maximum context length" in str(e) or "bad_request" in str(e).lower():
-                print(
-                    f"  Context window exceeded at max_tokens={effective_max}.",
-                    file=sys.stderr,
-                )
-            raise
-
-        output_est = _estimate_tokens(response)
-        json_raw, csv_section, _ = parse_response(response)
-
-        fr_from_api = (finish_reason or "").lower()
-        truncated_by_length = fr_from_api == "length"
-        truncated_by_heuristic = False
-        if not truncated_by_length and json_raw:
-            stripped = json_raw.rstrip()
-            if stripped and stripped[-1] not in ("}", "]"):
-                truncated_by_heuristic = True
-
-        truncated = truncated_by_length or truncated_by_heuristic
-        has_csv = bool(csv_section.strip())
-        json_tail = json_raw.rstrip()[-80:] if json_raw else "(empty)"
-
-        print(
-            f"    finish_reason={finish_reason}, ~{output_est} output tokens, "
-            f"has_csv={has_csv}",
-            file=sys.stderr,
-        )
-        print(f"    json tail: ...{json_tail!r}", file=sys.stderr)
-
-        if truncated:
-            reason = "finish_reason=length" if truncated_by_length else "heuristic (json doesn't end with } or ])"
-            print(
-                f"  Truncation detected via {reason}. Attempting JSON repair...",
-                file=sys.stderr,
-            )
-
-        return json_raw, csv_section, response
-
-    def _make_batches(records, size):
-        """Split a list into batches. size=0 means one batch with everything."""
-        if size <= 0:
-            return [records]
-        return [records[i:i + size] for i in range(0, len(records), size)]
-
-    def _run_batched(client, model_id, records, max_tokens, temperature,
-                     label="", only_batches=None,
-                     output_json=None, output_csv=None, is_jsonl=True):
-        """Run model on batches of slim payloads; re-inject corrections into
-        the original records. Returns (all_results, merged_csv, raw_responses).
-
-        Output is written **incrementally** after each batch so that progress
-        is saved even if the process is killed mid-run.
-
-        If *only_batches* is a set of 1-indexed batch numbers, only those
-        batches are sent to the API; the rest are skipped (their records pass
-        through uncorrected).
-        """
-        send_records = _slim_extract(records)
-        slim_batches = _make_batches(send_records, batch_size)
-        orig_batches = _make_batches(records, batch_size)
-        n_calls = len(slim_batches)
-        if only_batches:
-            run_count = sum(1 for i in range(1, n_calls + 1) if i in only_batches)
-            print(
-                f"  {label}{len(records)} records in {n_calls} batch(es) "
-                f"(batch_size={batch_size or 'all'}), running {run_count} selected batch(es): "
-                f"{sorted(only_batches)}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"  {label}{len(records)} records in {n_calls} batch(es) "
-                f"(batch_size={batch_size or 'all'})",
-                file=sys.stderr,
-            )
-
-        all_corrections = []
-        csv_header = None
-        csv_data_lines = []
-        raw_responses = []
-
-        json_fh = open(output_json, "w", encoding="utf-8") if output_json else None
-        csv_fh = open(output_csv, "w", encoding="utf-8", newline="") if output_csv else None
-
-        def _flush_json_batch(recs):
-            if not json_fh:
-                return
-            for rec in recs:
-                json_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            json_fh.flush()
-
-        def _flush_csv_rows(header, rows):
-            if not csv_fh:
-                return
-            if header and csv_fh.tell() == 0:
-                csv_fh.write(header + "\n")
-            for row in rows:
-                csv_fh.write(row + "\n")
-            csv_fh.flush()
-
-        failed = 0
-        try:
-            for batch_idx, (slim_batch, orig_batch) in enumerate(
-                zip(slim_batches, orig_batches), 1
-            ):
-                if only_batches and batch_idx not in only_batches:
-                    _flush_json_batch(orig_batch)
-                    continue
-                if batch_idx > 1:
-                    time.sleep(3)
-                print(
-                    f"  Batch {batch_idx}/{n_calls} ({len(slim_batch)} records)...",
-                    file=sys.stderr,
-                )
-                last_response = ""
-                try:
-                    json_raw, csv_section, last_response = _run_model(
-                        client, model_id, slim_batch, max_tokens, temperature,
-                    )
-                    raw_responses.append(last_response)
-
-                    result = _try_parse_json(json_raw)
-                    batch_corrections = result if isinstance(result, list) else [result]
-                    all_corrections.extend(batch_corrections)
-
-                    corrected = _slim_reinject(orig_batch, batch_corrections)
-                    _flush_json_batch(corrected)
-
-                    hdr, rows = _csv_body_lines(csv_section)
-                    if hdr and csv_header is None:
-                        csv_header = hdr
-                    csv_data_lines.extend(rows)
-                    _flush_csv_rows(hdr, rows)
-
-                except Exception as e:
-                    failed += 1
-                    print(
-                        f"  Batch {batch_idx} failed (skipping): {e}",
-                        file=sys.stderr,
-                    )
-                    if last_response:
-                        preview = last_response[:300].replace("\n", "\\n")
-                        print(f"    Raw response preview: {preview}", file=sys.stderr)
-                    _flush_json_batch(orig_batch)
-        finally:
-            if json_fh:
-                json_fh.close()
-                print(f"  Output saved to {output_json}", file=sys.stderr)
-            if csv_fh:
-                csv_fh.close()
-                if output_csv:
-                    print(f"  Output saved to {output_csv}", file=sys.stderr)
-
-        if failed:
-            print(
-                f"  {failed}/{n_calls} batch(es) failed",
-                file=sys.stderr,
-            )
-
-        merged_csv = ""
-        if csv_header:
-            merged_csv = csv_header + "\n" + "\n".join(csv_data_lines)
-            if not merged_csv.endswith("\n"):
-                merged_csv += "\n"
-
-        all_results = _slim_reinject(records, all_corrections)
-        return all_results, merged_csv, raw_responses
-
-    def _write_json(path, result, is_jsonl):
-        with open(path, "w", encoding="utf-8") as f:
-            if is_jsonl and isinstance(result, list):
-                for obj in result:
-                    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            else:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-
     # ── Load input ───────────────────────────────────────────────────────
     payload = _load_input(input_path, use_jsonl)
     n_records = len(payload) if isinstance(payload, list) else 1
@@ -720,6 +724,7 @@ def main():
                     all_results, merged_csv, _ = _run_batched(
                         client, mid, payload, args.max_tokens, args.temperature,
                         label=f"[{short_name}] ",
+                        batch_size=batch_size,
                         only_batches=only_batches,
                         output_json=json_path,
                         output_csv=csv_path,
@@ -770,6 +775,7 @@ def main():
         if use_jsonl and isinstance(payload, list):
             all_results, merged_csv, raw_responses = _run_batched(
                 client, model_id, payload, args.max_tokens, args.temperature,
+                batch_size=batch_size,
                 only_batches=only_batches,
                 output_json=args.output_json,
                 output_csv=args.output_csv,
