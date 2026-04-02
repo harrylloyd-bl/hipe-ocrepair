@@ -49,7 +49,7 @@ MODEL_REGISTRY = {
     "qwen3-235b-a22b-thinking-2507": "Qwen/Qwen3-235B-A22B-Thinking-2507",
     "mistral3": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
     "gemma3": "google/gemma-3-27b-it",
-    "deepseek-v3.2": "deepseek-ai/DeepSeek-V3.2",
+    "deepseek": "deepseek-ai/DeepSeek-V3.2",
 }
 
 MODEL_CONTEXT_WINDOW: dict[str, dict[str, int]] = {
@@ -71,6 +71,10 @@ MODEL_CONTEXT_WINDOW: dict[str, dict[str, int]] = {
 
 DEFAULT_CONTEXT_WINDOW = 32768
 CONTEXT_SAFETY_MARGIN = 256  # tokens reserved for framing overhead
+
+# Hub context windows can be huge; most Inference Providers cap completion tokens (often 4k–32k).
+# Sending ~130k max_tokens causes 400 Bad request from several routers.
+_INFERENCE_MAX_OUTPUT_CAP = int(os.environ.get("OCR_INFERENCE_MAX_OUTPUT", "16384"))
 
 def _estimate_tokens(text: str) -> int:
     """Rough token count: ~3.5 characters per token for mixed JSON/English text."""
@@ -122,7 +126,7 @@ Columns: document_id,ocr_hypothesis_snippet,ocr_postcorrection_snippet,error_typ
 API_TIMEOUT = 600  # seconds per request before giving up
 
 
-def get_client() -> InferenceClient:
+def get_client(provider: str | None = None) -> InferenceClient:
     """Create and return a Hugging Face InferenceClient, authenticated with HF_TOKEN."""
     token = os.environ.get("HF_TOKEN")
     if not token:
@@ -134,19 +138,68 @@ def get_client() -> InferenceClient:
                 "No token provided. Create one at https://huggingface.co/settings/tokens "
                 "with 'Make calls to Inference Providers'."
             )
-    return InferenceClient(api_key=token.strip(), timeout=API_TIMEOUT)
+    kwargs: dict = {"api_key": token.strip(), "timeout": API_TIMEOUT}
+    if provider:
+        kwargs["provider"] = provider
+    return InferenceClient(**kwargs)
+
+
+def resolve_inference_provider(
+    resolved_model_id: str,
+    cli_provider: str | None,
+    run_all: bool,
+) -> str | None:
+    """HF Inference routing: which third-party backend to use (None = hub default / auto).
+
+    deepseek-ai/DeepSeek-V3.2 is tagged text-generation on the Hub; auto routing often
+    rejects chat while provider ``novita`` serves it as conversational only — default
+    novita for that model unless HF_INFERENCE_PROVIDER or --hf-provider overrides.
+    """
+    if cli_provider is not None:
+        p = cli_provider.strip().lower()
+        return None if p in ("", "auto") else cli_provider.strip()
+    env = os.environ.get("HF_INFERENCE_PROVIDER")
+    if env is not None:
+        e = env.strip().lower()
+        return None if e in ("", "auto") else env.strip()
+    if run_all:
+        return None
+    base = resolved_model_id.split(":", 1)[0]
+    if base == "deepseek-ai/DeepSeek-V3.2":
+        return "novita"
+    return None
 
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = [30, 60, 120]  # seconds to wait between retries
 
 
-def chat_completion(client, model: str, messages: list, **kwargs):
-    """Send a chat completion request with automatic retries on timeout.
+def _format_inference_exception(exc: BaseException) -> str:
+    """HF Hub 400s are multi-line (Request ID, 'Bad request:', JSON body); join for stderr."""
+    parts: list[str] = []
+    sm = getattr(exc, "server_message", None)
+    if sm and str(sm).strip():
+        parts.append(str(sm).strip())
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        try:
+            txt = (resp.text or "").strip()
+        except Exception:
+            txt = ""
+        if txt:
+            if len(txt) > 4000:
+                txt = txt[:4000] + "…"
+            blob = "\n".join(parts)
+            if txt not in blob:
+                parts.append(txt)
+    full = str(exc).strip()
+    if full and full not in "\n".join(parts):
+        parts.append(full)
+    return "\n\n".join(parts) if parts else repr(exc)
 
-    Returns (content, finish_reason).  finish_reason is typically "stop"
-    (complete) or "length" (output was truncated by max_tokens).
-    """
+
+def chat_completion(client, model: str, messages: list, **kwargs):
+    """Send a chat completion request with automatic retries on timeout."""
     for attempt in range(MAX_RETRIES + 1):
         try:
             result = client.chat.completions.create(
@@ -397,12 +450,13 @@ def _run_model(client: InferenceClient, model_id: str,
     input_est = _estimate_tokens("".join(m["content"] for m in messages))
     auto_max = _compute_max_tokens(model_id, messages)
     effective_max = min(max_tokens, auto_max) if max_tokens else auto_max
+    effective_max = min(effective_max, _INFERENCE_MAX_OUTPUT_CAP)
     breakpoint()
     base_id = model_id.split(":")[0]
     ctx = MODEL_CONTEXT_WINDOW["input"].get(base_id, DEFAULT_CONTEXT_WINDOW)
     print(
         f"    context_window={ctx}, ~{input_est} input tokens, "
-        f"max_output={effective_max}",
+        f"max_output={effective_max} (cap {_INFERENCE_MAX_OUTPUT_CAP})",
         file=sys.stderr,
     )
 
@@ -554,7 +608,7 @@ def _run_batched(client, model_id, records, max_tokens, temperature, batch_size:
             except Exception as e:
                 failed += 1
                 print(
-                    f"  Batch {batch_idx} failed (skipping): {e}",
+                    f"  Batch {batch_idx} failed (skipping):\n{_format_inference_exception(e)}",
                     file=sys.stderr,
                 )
                 if last_response:
@@ -642,6 +696,13 @@ def main():
         default=os.environ.get("OCR_HF_MODEL", ""),   # can also be set via env var
         help="Model: short name (e.g. qwen3.5-397b-a17b, mistral3, gemma3, deepseek-v3.2) or full HF ID.",
     )
+    parser.add_argument(
+        "--hf-provider",
+        default=None,
+        metavar="NAME",
+        help="HF Inference provider (novita, together, …). Overrides HF_INFERENCE_PROVIDER. "
+        "Use 'auto' for default hub routing. If unset, DeepSeek-V3.2 defaults to novita.",
+    )
     # --list-models: print the registry and exit
     parser.add_argument(
         "--list-models",
@@ -727,7 +788,10 @@ def main():
         if not os.path.exists(out_dir):
             os.makedirs(out_dir, exist_ok=False)
 
-        client = get_client()
+        prov = resolve_inference_provider("", args.hf_provider, run_all=True)
+        if prov:
+            print(f"Inference provider: {prov}", file=sys.stderr)
+        client = get_client(provider=prov)
 
         for short_name, full_id in MODEL_REGISTRY.items():
             mid = f"{full_id}:cheapest" if args.cheapest else full_id
@@ -779,7 +843,10 @@ def main():
         if not args.output_csv:
             args.output_csv = os.path.join(out_dir, f"{short_name}.csv")
 
-    client = get_client()
+    prov = resolve_inference_provider(model_id, args.hf_provider, run_all=False)
+    if prov:
+        print(f"Inference provider: {prov}", file=sys.stderr)
+    client = get_client(provider=prov)
 
     if not any([args.output_json, args.output_csv, args.output_raw]):
         print(
