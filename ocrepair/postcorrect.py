@@ -45,16 +45,18 @@ logging.basicConfig(filename=f"logs/{datetime.now().strftime('%Y%m%d_%H%M')}.log
 # Lookup table mapping friendly short names to full Hugging Face model IDs.
 # This lets you type e.g. --model mistral3 instead of the full path.
 MODEL_REGISTRY = {
-    "qwen3.5-397b-a17b": "Qwen/Qwen3.5-397B-A17B",
-    "qwen3-235b-a22b-thinking-2507": "Qwen/Qwen3-235B-A22B-Thinking-2507",
+    "qwen3.5": "Qwen/Qwen3.5-397B-A17B",
+    "qwen3": "Qwen/Qwen3-235B-A22B-Thinking-2507",
     "mistral3": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
     "gemma3": "google/gemma-3-27b-it",
+    "gemma4": "google/gemma-4-26B-A4B-it",
     "deepseek": "deepseek-ai/DeepSeek-V3.2",
 }
 
 MODEL_CONTEXT_WINDOW: dict[str, dict[str, int]] = {
     "input":{
         "google/gemma-3-27b-it": 32768,
+        "google/gemma-4-26B-A4B-it": 262144,
         "mistralai/Mistral-Small-3.1-24B-Instruct-2503": 131072,
         "Qwen/Qwen3.5-397B-A17B": 262144,
         "Qwen/Qwen3-235B-A22B-Thinking-2507": 262144,
@@ -62,6 +64,7 @@ MODEL_CONTEXT_WINDOW: dict[str, dict[str, int]] = {
     },
     "output":{
         "google/gemma-3-27b-it": 8192 ,
+        "google/gemma-4-26B-A4B-it": 8192,
         "mistralai/Mistral-Small-3.1-24B-Instruct-2503": 131072,
         "Qwen/Qwen3.5-397B-A17B": 262144,
         "Qwen/Qwen3-235B-A22B-Thinking-2507": 262144,
@@ -214,6 +217,7 @@ def chat_completion(client, model: str, messages: list, **kwargs):
             is_retryable = any(
                 kw in err_str
                 for kw in ("timeout", "gateway", "502", "503", "504", "529",
+                           "429", "too many requests", "rate limit",
                            "prematurely", "connection", "reset", "broken pipe")
             )
             if not is_retryable or attempt == MAX_RETRIES:
@@ -515,11 +519,22 @@ def _make_batches(records, size):
     return [records[i:i + size] for i in range(0, len(records), size)]
 
 
+def _retry_output_path(path: str | None, suffix: str = "_retry") -> str | None:
+    """Build a sibling path: out.jsonl -> out_retry.jsonl (separate from main outputs)."""
+    if not path:
+        return None
+    root, ext = os.path.splitext(path)
+    return f"{root}{suffix}{ext}"
+
+
 def _run_batched(client, model_id, records, max_tokens, temperature, batch_size: int, 
                 label="", only_batches=None,
                 output_json=None, output_csv=None, is_jsonl=True):
     """Run model on batches of slim payloads; re-inject corrections into
-    the original records. Returns (all_results, merged_csv, raw_responses).
+    the original records.
+
+    Returns (all_results, merged_csv, raw_responses, failed_batches) where
+    *failed_batches* is a list of 1-based batch indices that raised.
 
     Output is written **incrementally** after each batch so that progress
     is saved even if the process is killed mid-run.
@@ -572,6 +587,7 @@ def _run_batched(client, model_id, records, max_tokens, temperature, batch_size:
         csv_fh.flush()
 
     failed = 0
+    failed_batches: list[int] = []
     try:
         for batch_idx, (slim_batch, orig_batch) in enumerate(
             zip(slim_batches, orig_batches), 1
@@ -607,6 +623,7 @@ def _run_batched(client, model_id, records, max_tokens, temperature, batch_size:
 
             except Exception as e:
                 failed += 1
+                failed_batches.append(batch_idx)
                 print(
                     f"  Batch {batch_idx} failed (skipping):\n{_format_inference_exception(e)}",
                     file=sys.stderr,
@@ -625,8 +642,9 @@ def _run_batched(client, model_id, records, max_tokens, temperature, batch_size:
                 print(f"  Output saved to {output_csv}", file=sys.stderr)
 
     if failed:
+        batch_list = ", ".join(str(b) for b in sorted(failed_batches))
         print(
-            f"  {failed}/{n_calls} batch(es) failed",
+            f"  {failed}/{n_calls} batch(es) failed. Failed batches: {batch_list}",
             file=sys.stderr,
         )
 
@@ -637,7 +655,7 @@ def _run_batched(client, model_id, records, max_tokens, temperature, batch_size:
             merged_csv += "\n"
 
     all_results = _slim_reinject(records, all_corrections)
-    return all_results, merged_csv, raw_responses
+    return all_results, merged_csv, raw_responses, failed_batches
 
 def _write_json(path, result, is_jsonl):
     with open(path, "w", encoding="utf-8") as f:
@@ -694,7 +712,7 @@ def main():
     parser.add_argument(
         "--model",
         default=os.environ.get("OCR_HF_MODEL", ""),   # can also be set via env var
-        help="Model: short name (e.g. qwen3.5-397b-a17b, mistral3, gemma3, deepseek-v3.2) or full HF ID.",
+        help="Model: short name (e.g. qwen3.5-397b-a17b, mistral3, gemma3, gemma4, deepseek-v3.2) or full HF ID.",
     )
     parser.add_argument(
         "--hf-provider",
@@ -802,7 +820,7 @@ def main():
 
             try:
                 if use_jsonl and isinstance(payload, list):
-                    all_results, merged_csv, _ = _run_batched(
+                    all_results, merged_csv, _, _ = _run_batched(
                         client, mid, payload, args.max_tokens, args.temperature,
                         label=f"[{short_name}] ",
                         batch_size=batch_size,
@@ -857,7 +875,7 @@ def main():
 
     try:
         if use_jsonl and isinstance(payload, list):
-            all_results, merged_csv, raw_responses = _run_batched(
+            all_results, merged_csv, raw_responses, failed_batches = _run_batched(
                 client, model_id, payload, args.max_tokens, args.temperature,
                 batch_size=batch_size,
                 only_batches=only_batches,
@@ -869,6 +887,29 @@ def main():
                     args.output_raw.write(f"=== batch {i} ===\n{resp}\n")
                 args.output_raw.close()
                 print("Raw output written to", args.output_raw.name, file=sys.stderr)
+            if failed_batches and args.output_json and sys.stdin.isatty():
+                try:
+                    ans = input(
+                        "\nRetry failed batches to separate files? [y/N]: "
+                    ).strip().lower()
+                except EOFError:
+                    ans = ""
+                if ans == "y":
+                    rj = _retry_output_path(args.output_json)
+                    rc = _retry_output_path(args.output_csv) if args.output_csv else None
+                    fb = ", ".join(str(b) for b in sorted(failed_batches))
+                    print(
+                        f"  Retrying batches [{fb}] -> {rj!r}"
+                        + (f", {rc!r}" if rc else ""),
+                        file=sys.stderr,
+                    )
+                    _run_batched(
+                        client, model_id, payload, args.max_tokens, args.temperature,
+                        batch_size=batch_size,
+                        only_batches=set(failed_batches),
+                        output_json=rj,
+                        output_csv=rc,
+                    )
         else:
             json_raw, csv_section, response = _run_model(
                 client, model_id, SYSTEM_PROMPT, payload, args.max_tokens, args.temperature,
