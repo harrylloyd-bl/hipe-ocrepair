@@ -46,7 +46,6 @@ logging.basicConfig(filename=f"logs/{datetime.now().strftime('%Y%m%d_%H%M')}.log
 # This lets you type e.g. --model mistral3 instead of the full path.
 MODEL_REGISTRY = {
     "qwen3.5": "Qwen/Qwen3.5-397B-A17B",
-    "qwen3": "Qwen/Qwen3-235B-A22B-Thinking-2507",
     "mistral3": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
     "gemma3": "google/gemma-3-27b-it",
     "gemma4": "google/gemma-4-26B-A4B-it",
@@ -59,7 +58,6 @@ MODEL_CONTEXT_WINDOW: dict[str, dict[str, int]] = {
         "google/gemma-4-26B-A4B-it": 262144,
         "mistralai/Mistral-Small-3.1-24B-Instruct-2503": 131072,
         "Qwen/Qwen3.5-397B-A17B": 262144,
-        "Qwen/Qwen3-235B-A22B-Thinking-2507": 262144,
         "deepseek-ai/DeepSeek-V3.2": 131072,
     },
     "output":{
@@ -67,7 +65,6 @@ MODEL_CONTEXT_WINDOW: dict[str, dict[str, int]] = {
         "google/gemma-4-26B-A4B-it": 8192,
         "mistralai/Mistral-Small-3.1-24B-Instruct-2503": 131072,
         "Qwen/Qwen3.5-397B-A17B": 262144,
-        "Qwen/Qwen3-235B-A22B-Thinking-2507": 262144,
         "deepseek-ai/DeepSeek-V3.2": 131072,
     }
 }
