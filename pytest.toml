@@ -1,0 +1,4 @@
+[pytest]
+markers = [
+    "paid: marks tests as interacting with paid HF services (deselect with '-m \"not paid\"')"
+]
