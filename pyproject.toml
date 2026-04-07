@@ -1,5 +1,5 @@
 [project]
-name = "hipe-ocrepair"
+name = "ocrepair"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -10,13 +10,19 @@ dependencies = [
     "jupyter>=1.1.1",
     "numpy>=2.4.3",
     "pandas>=3.0.1",
+    "pytest>=9.0.2",
+    "python-dotenv>=1.2.2",
     "seaborn>=0.13.2",
 ]
 
 [tool.uv.workspace]
 members = [
     "HIPE-OCRepair-scorer",
+    ".",
 ]
 
 [tool.uv.sources]
 hipe-ocrepair-scorer = { workspace = true, editable = true }
+
+[dependency-groups]
+dev = []

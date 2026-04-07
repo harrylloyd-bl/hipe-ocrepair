@@ -1,1 +1,1 @@
-from ocrepair import config  # noqa: F401
+from ocrepair import postcorrect  # noqa: F401
