@@ -144,16 +144,28 @@ def get_client(provider: str | None = None) -> InferenceClient:
     return InferenceClient(**kwargs)
 
 
+def _default_inference_provider(base_model_id: str) -> str | None:
+    """Per-model provider when CLI/env do not set one (None = hub router default).
+
+    * DeepSeek-V3.2 — Hub tags / router often reject chat; ``novita`` exposes it as chat.
+    * Mistral-Small-3.1-24B — router returns *not a chat model* on chat completions;
+      ``featherless-ai`` serves it as chat for Inference API.
+    """
+    if base_model_id == "deepseek-ai/DeepSeek-V3.2":
+        return "novita"
+    if base_model_id == "mistralai/Mistral-Small-3.1-24B-Instruct-2503":
+        return "featherless-ai"
+    return None
+
+
 def resolve_inference_provider(
     resolved_model_id: str,
     cli_provider: str | None,
-    run_all: bool,
 ) -> str | None:
-    """HF Inference routing: which third-party backend to use (None = hub default / auto).
+    """HF Inference routing: third-party backend (None = hub default / auto).
 
-    deepseek-ai/DeepSeek-V3.2 is tagged text-generation on the Hub; auto routing often
-    rejects chat while provider ``novita`` serves it as conversational only — default
-    novita for that model unless HF_INFERENCE_PROVIDER or --hf-provider overrides.
+    Override with ``--hf-provider`` or ``HF_INFERENCE_PROVIDER``; otherwise use
+    :func:`_default_inference_provider` for models that break on default chat routing.
     """
     if cli_provider is not None:
         p = cli_provider.strip().lower()
@@ -162,12 +174,8 @@ def resolve_inference_provider(
     if env is not None:
         e = env.strip().lower()
         return None if e in ("", "auto") else env.strip()
-    if run_all:
-        return None
     base = resolved_model_id.split(":", 1)[0]
-    if base == "deepseek-ai/DeepSeek-V3.2":
-        return "novita"
-    return None
+    return _default_inference_provider(base)
 
 
 MAX_RETRIES = 3
@@ -715,7 +723,7 @@ def main():
         "--hf-provider",
         default=None,
         metavar="NAME",
-        help="HF Inference provider (novita, together, …). Overrides HF_INFERENCE_PROVIDER. "
+        help="HF Inference provider (novita, featherless-ai, together, …). Overrides HF_INFERENCE_PROVIDER. "
         "Use 'auto' for default hub routing. If unset, DeepSeek-V3.2 defaults to novita.",
     )
     # --list-models: print the registry and exit
@@ -728,7 +736,8 @@ def main():
     parser.add_argument(
         "--run-all",
         action="store_true",
-        help="Run all registered test models; write <short_name>.json and <short_name>.csv in output_dir.",
+        help="Run all registered test models; write <input_stem>_<short_name>.jsonl|.json and .csv in output_dir "
+        "(input_stem is the basename of the input file without extension).",
     )
     # --output-dir: folder for --run-all results
     parser.add_argument(
@@ -803,17 +812,23 @@ def main():
         if not os.path.exists(out_dir):
             os.makedirs(out_dir, exist_ok=False)
 
-        prov = resolve_inference_provider("", args.hf_provider, run_all=True)
-        if prov:
-            print(f"Inference provider: {prov}", file=sys.stderr)
-        client = get_client(provider=prov)
-
+        input_stem = os.path.splitext(os.path.basename(input_path))[0]
+        clients_by_provider: dict[str | None, InferenceClient] = {}
         for short_name, full_id in MODEL_REGISTRY.items():
             mid = f"{full_id}:cheapest" if args.cheapest else full_id
+            prov = resolve_inference_provider(mid, args.hf_provider)
+            prov_label = prov if prov else "hub default"
+            if prov not in clients_by_provider:
+                clients_by_provider[prov] = get_client(provider=prov)
+            client = clients_by_provider[prov]
             ext = "jsonl" if use_jsonl else "json"
-            json_path = os.path.join(out_dir, f"hipe-ocrepair-bench_v0.9_{short_name}.{ext}")
-            csv_path = os.path.join(out_dir, f"hipe-ocrepair-bench_v0.9_{short_name}.csv")
-            print(f"Running {short_name} ({mid}) -> {json_path}, {csv_path}", file=sys.stderr)
+            json_path = os.path.join(out_dir, f"{input_stem}_{short_name}.{ext}")
+            csv_path = os.path.join(out_dir, f"{input_stem}_{short_name}.csv")
+            print(
+                f"Running {short_name} ({mid}) [provider: {prov_label}] -> {json_path}, {csv_path}",
+                file=sys.stderr,
+            )
+
 
             try:
                 if use_jsonl and isinstance(payload, list):
@@ -858,7 +873,7 @@ def main():
         if not args.output_csv:
             args.output_csv = os.path.join(out_dir, f"{short_name}.csv")
 
-    prov = resolve_inference_provider(model_id, args.hf_provider, run_all=False)
+    prov = resolve_inference_provider(model_id, args.hf_provider)
     if prov:
         print(f"Inference provider: {prov}", file=sys.stderr)
     client = get_client(provider=prov)
