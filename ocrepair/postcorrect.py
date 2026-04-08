@@ -42,6 +42,7 @@ if not os.path.exists("logs"):
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename=f"logs/{datetime.now().strftime('%Y%m%d_%H%M')}.log", encoding="utf8", level=logging.DEBUG)
 
+# Hi Valentina!
 # Lookup table mapping friendly short names to full Hugging Face model IDs.
 # This lets you type e.g. --model mistral3 instead of the full path.
 MODEL_REGISTRY = {
