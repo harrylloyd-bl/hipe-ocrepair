@@ -42,7 +42,6 @@ if not os.path.exists("logs"):
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename=f"logs/{datetime.now().strftime('%Y%m%d_%H%M')}.log", encoding="utf8", level=logging.DEBUG)
 
-# Hi Valentina!
 # Lookup table mapping friendly short names to full Hugging Face model IDs.
 # This lets you type e.g. --model mistral3 instead of the full path.
 MODEL_REGISTRY = {
@@ -180,7 +179,7 @@ def resolve_inference_provider(
 
 
 MAX_RETRIES = 3
-RETRY_BACKOFF = [30, 60, 120]  # seconds to wait between retries
+RETRY_BACKOFF = [1, 1, 1]  # seconds to wait between retries
 
 
 def _format_inference_exception(exc: BaseException) -> str:
@@ -442,6 +441,25 @@ def _slim_reinject(original_records: list[Record], corrections: list[Record]):
     return merged
 
 
+def _echo_ocr_input_as_postcorrection(records: list[Record]) -> list[Record]:
+    """Copy ``ocr_hypothesis`` text into ``ocr_postcorrection_output`` (same shape as successful reinject).
+
+    Used when a batch fails after all API retries: the submission field still contains the
+    model input (OCR text) instead of leaving prior/empty post-correction.
+    """
+    out: list[Record] = []
+    for rec in records:
+        rec = json.loads(json.dumps(rec))
+        hyp = rec.get("ocr_hypothesis", {})
+        hyp_text = hyp.get("transcription_unit", "") if isinstance(hyp, dict) else str(hyp)
+        if isinstance(rec.get("ocr_postcorrection_output"), dict):
+            rec["ocr_postcorrection_output"]["transcription_unit"] = hyp_text
+        else:
+            rec["ocr_postcorrection_output"] = hyp_text
+        out.append(rec)
+    return out
+
+
 def _build_messages(system_prompt: str, payload: list[Record]|str):
     user_content = json.dumps(payload, ensure_ascii=False, indent=0)
     return [
@@ -461,7 +479,7 @@ def _run_model(client: InferenceClient, model_id: str,
     auto_max = _compute_max_tokens(model_id, messages)
     effective_max = min(max_tokens, auto_max) if max_tokens else auto_max
     effective_max = min(effective_max, _INFERENCE_MAX_OUTPUT_CAP)
-    breakpoint()
+    
     base_id = model_id.split(":")[0]
     ctx = MODEL_CONTEXT_WINDOW["input"].get(base_id, DEFAULT_CONTEXT_WINDOW)
     print(
@@ -637,7 +655,13 @@ def _run_batched(client, model_id, records, max_tokens, temperature, batch_size:
                 if last_response:
                     preview = last_response[:300].replace("\n", "\\n")
                     print(f"    Raw response preview: {preview}", file=sys.stderr)
-                _flush_json_batch(orig_batch)
+                echoed = _echo_ocr_input_as_postcorrection(orig_batch)
+                print(
+                    f"  Batch {batch_idx}: OCR hypothesis copied into ocr_postcorrection_output "
+                    f"({len(echoed)} record(s); batch failed after retries).",
+                    file=sys.stderr,
+                )
+                _flush_json_batch(echoed)
     finally:
         if json_fh:
             json_fh.close()
